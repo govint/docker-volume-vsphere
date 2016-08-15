@@ -313,7 +313,7 @@ def make_list_of_values(allowed):
             if g not in allowed:
                 msg = (
 		   'invalid choices: {0} (choices must be a comma separated list of '
-                   'only the following words {1}. '  
+                   'only the following words \n {1}. '  
 		   'No spaces are allowed between choices.)').format(g, repr(allowed).replace(' ', ''))
                 raise argparse.ArgumentTypeError(msg)
         return given
