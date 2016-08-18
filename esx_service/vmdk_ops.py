@@ -620,11 +620,11 @@ def findDeviceByPath(vmdk_path, vm):
 
 # Find the PCI slot number
 def get_controller_pci_slot(vm, pvscsi, key_offset):
-    if pvscsi[0].slotInfo:
-       return str(pvscsi[0].slotInfo.pciSlotNumber)
+    if pvscsi.slotInfo:
+       return str(pvscsi.slotInfo.pciSlotNumber)
     else:
        # Slot number is got from from the VM config
-       key = 'scsi{0}.pciSlotNumber'.format(pvscsi[0].key -
+       key = 'scsi{0}.pciSlotNumber'.format(pvscsi.key -
                                             key_offset)
        slot = [cfg for cfg in vm.config.extraConfig \
                if cfg.key == key]
@@ -633,7 +633,6 @@ def get_controller_pci_slot(vm, pvscsi, key_offset):
           return slot[0].value
        else:
           return None
-
 
 def dev_info(unit_number, pci_slot_number):
     '''Return a dictionary with Unit/Bus for the vmdk (or error)'''
@@ -691,7 +690,6 @@ def getStatusAttached(vmdk_path):
         uuid = None
     return attached, uuid, attach_as
 
-
 def disk_attach(vmdk_path, vm):
     '''
     Attaches *existing* disk to a vm on a PVSCI controller
@@ -727,7 +725,7 @@ def disk_attach(vmdk_path, vm):
                    if type(d) == vim.ParaVirtualSCSIController and
                       d.key == device.controllerKey]
         return dev_info(device.unitNumber,
-                        get_controller_pci_slot(vm, pvsci,
+                        get_controller_pci_slot(vm, pvsci[0],
                                                 offset_from_bus_number))
 
     # Disk isn't attached, make sure we have a PVSCI and add it if we don't
@@ -743,9 +741,10 @@ def disk_attach(vmdk_path, vm):
     if len(pvsci) > 0:
         disk_slot = None  # need to find out
         controller_key = pvsci[0].key
-        pci_slot_number = get_controller_pci_slot(vm, pvsci,
+        pci_slot_number = get_controller_pci_slot(vm, pvsci[0],
                                                   offset_from_bus_number)
     else:
+        
         logging.warning(
             "Warning: PVSCI adapter is missing - trying to add one...")
         disk_slot = 0  # starting on a fresh controller
@@ -753,7 +752,7 @@ def disk_attach(vmdk_path, vm):
             msg = "Failed to place PVSCI adapter - out of bus slots"
             logging.error(msg + " VM=%s", vm.config.uuid)
             return err(msg)
-
+        
         # find empty bus slot for the controller:
         taken = set([c.busNumber for c in controllers])
         avail = set(range(0, max_scsi_controllers)) - taken
@@ -777,31 +776,90 @@ def disk_attach(vmdk_path, vm):
         except vim.fault.VimFault as ex:
             msg=("Failed to add PVSCSI Controller: %s", ex.msg)
             return err(msg)
+            
         # Find the controller just added
         devices = vm.config.hardware.device
         pvsci = [d for d in devices
                  if type(d) == vim.ParaVirtualSCSIController and
                  d.key == controller_key]
-        pci_slot_number = get_controller_pci_slot(vm, pvsci,
+        pci_slot_number = get_controller_pci_slot(vm, pvsci[0],
                                                   offset_from_bus_number)
 
     # Find a slot on the controller, issue attach task and wait for completion
     if not disk_slot:
-        taken = set([dev.unitNumber
+        idx = 0
+           
+        while ((disk_slot is None) and (idx < len(pvsci))):
+            controller_key = pvsci[idx].key
+            taken = set([dev.unitNumber
                      for dev in devices
                      if type(dev) == vim.VirtualDisk and dev.controllerKey ==
                      controller_key])
-        # search in 15 slots, with unit_number 7 reserved for scsi controller
-        availSlots = (set(range(0, 7)) | set(range(8, 16))) - taken
+            # search in 15 slots, with unit_number 7 reserved for scsi controller
+            availSlots = (set(range(0, 7)) | set(range(8, 16))) - taken
+            logging.debug("idx=%d controller_key=%d availSlots=%d", idx, controller_key, len(availSlots))
 
-        if len(availSlots) == 0:
-            msg = "Failed to place new disk - out of disk slots"
-            logging.error(msg + " VM=%s", vm.config.uuid)
-            return err(msg)
+            if len(availSlots) == 0:
+                idx = idx+1
+            else:     
+                disk_slot = availSlots.pop()
+                pci_slot_number = get_controller_pci_slot(vm, pvsci[idx],
+                                                          offset_from_bus_number)
+                 
+                logging.debug("Find an available slot: controller_key = %d slot = %d", controller_key, disk_slot)
 
-        disk_slot = availSlots.pop()
-        logging.debug("controller_key = %d slot = %d", controller_key, disk_slot)
+        # search through all the existing pvscsi controller, and cannot find a slot
+        # try to add another pvscsi controller if possible        
+        if ((disk_slot is None) and (len(availSlots) == 0)):
+            disk_slot = 0  # starting on a fresh controller
+            if len(controllers) >= max_scsi_controllers:
+                msg = "Failed to place new disk - out of disk slots"
+                logging.error(msg + " VM=%s", vm.config.uuid)
+                return err(msg)
+                    
+            # find empty bus slot for the controller:
+            taken = set([c.busNumber for c in controllers])
+            avail = set(range(0, max_scsi_controllers)) - taken
 
+            key = avail.pop()  # bus slot
+            controller_key = key + offset_from_bus_number
+            controller_spec = vim.VirtualDeviceConfigSpec(
+            operation='add',
+            device=vim.ParaVirtualSCSIController(key=controller_key,
+                                                 busNumber=key,
+                                                 sharedBus='noSharing', ), )
+            # changes spec content goes here
+            pvscsi_change = []
+            pvscsi_change.append(controller_spec)
+            spec = vim.vm.ConfigSpec()
+            spec.deviceChange = pvscsi_change
+
+            try:
+                wait_for_tasks(si, [vm.ReconfigVM_Task(spec=spec)])
+            except vim.fault.VimFault as ex:
+                msg=("Failed to add PVSCSI Controller: %s", ex.msg)
+                return err(msg)
+            
+            logging.info("Add a new pvscsi controller, id=%d", controller_key) 
+
+            # get all the pvscsi controller
+            devices = vm.config.hardware.device
+            pvsci = [d for d in devices
+              if type(d) == vim.ParaVirtualSCSIController and
+                 d.key == controller_key]
+
+            new_idx = None  
+            for x in range (0, len(pvsci)):
+                if (pvsci[x].key == controller_key):
+                    new_idx = x
+                    break
+                     
+            # get the pci_slot_number of newly added pvscsi controller  
+            logging.debug("idx for newly added pvscsi controller is %d", new_idx)
+            pci_slot_number = get_controller_pci_slot(vm, pvsci[new_idx],
+                                                          offset_from_bus_number)
+ 
+  
     # add disk as independent, so it won't be snapshotted with the Docker VM
     disk_spec = vim.VirtualDeviceConfigSpec(
         operation='add',
