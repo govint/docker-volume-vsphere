@@ -840,7 +840,6 @@ def find_available_disk_slot(vm, devices, pvsci, offset_from_bus_number):
                 idx = idx + 1;
     return idx, disk_slot            
             
->>>>>>> Add proper PVSCSI controller/disks create() automation (#580)
 def disk_attach(vmdk_path, vm):
     '''
     Attaches *existing* disk to a vm on a PVSCI controller
