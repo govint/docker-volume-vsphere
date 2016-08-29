@@ -51,6 +51,17 @@ COLLECTION_INTERVAL = 20
 SAMPLE_SIZE = 1
 DEFAULT_SAMPLE_SIZE = SAMPLE_SIZE
 
+# NAmes of metrics that we support.
+disk_metrics = ['avg_read_req_in_progress', 'avg_write_req_in_progress',\
+                'avg_read_req_per_sec', 'avg_write_per_sec',\
+                'large_seek_cnt', 'medium_seek_cnt',\
+                'small_seek_cnt', 'read_latency(us)',\
+                'avg_read_latency', 'read_rate',\
+                'read_req_size', 'read_workload',\
+                'write_latency(us)', 'write_latency',\
+                'write_rate', 'write_req_size',\
+                'write_workload']
+
 # Global map of counter IDs supported by the performance manager.
 perf_counters_map = {}
 
@@ -174,10 +185,12 @@ def get_vol_stats(vm, bus, unit):
    # Build the response with label, summary and value for each counter
    perf_stats = {}
    print(metrics)
-   for metric in metrics[0].value:
-      label = perf_counters_map[metric.id.counterId][LABEL]
-      summary = perf_counters_map[metric.id.counterId][SUMMARY]
-      perf_stats[label] = {'value': metric.value, 'summary': summary}
+   for metric in range(len(metrics[0].value)):
+      #label = perf_counters_map[metric.id.counterId][LABEL]
+      label = disk_metrics[metric]
+      stat = metrics[0].value[metric]
+      summary = perf_counters_map[stat.id.counterId][SUMMARY]
+      perf_stats[label] = {'value': stat.value, 'summary': summary}
 
    return perf_stats
 
