@@ -144,7 +144,9 @@ def get_vol_stats(vm, bus, unit):
    if not vm_name in vm_dev_map or \
       not device in vm_dev_map[vm_name] or \
       not COUNTERS in vm_dev_map[vm_name][device]:
-     return None
+      # The daemon must have re-started, reinit
+      # the perf counter map for the VM and device 
+      init_perf_for_vol(vm, bus, unit)
 
    metric_ids = []
    for counter in vm_dev_map[vm_name][device][COUNTERS]:
