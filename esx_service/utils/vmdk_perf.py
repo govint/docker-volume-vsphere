@@ -35,11 +35,12 @@ DEFAULT_PERF_FORMAT = FORMAT_CSV
 # IO stats returned for the volume
 IO_STATS = 'iostats'
 
-# Lable per metric
+# Items per metric counter
 LABEL = 'label'
-
-# Summary description per metrix
+UNIT_INFO = 'unit_info'
 SUMMARY = 'summary'
+NUM_TYPE = 'num'
+IGN_TYPE = 'Ignore'
 
 # Performance counters per vm:device
 COUNTERS='counters'
@@ -62,6 +63,28 @@ perfm = None
 
 # The local service instance used by this module
 si = None
+
+# Metric short names
+metric_short_labels = {
+   "Average number of outstanding read requests": 'avgInProgReads',
+   "Average number of outstanding write requests": 'avgInProgWrites',
+   "Average read requests per second": 'avgRd/s',
+   "Average write requests per second": 'avgWr/s',
+   "Number of large seeks": 'largeSeekCnt (more than 8192 lbns)',
+   "Number of medium seeks": 'mediumSeekCnt(64 - 8192 lbns)',
+   "Number of small seeks": 'smallSeekCnt(less than 64 lbns)',
+   "Read Latency (us)": 'readLat',
+   "Read latency": 'avgReadLat',
+   "Read rate": 'volReadRate',
+   "Read request size": 'avgRdReqSz(bytes)',
+   "Read workload metric": 'Ignore',
+   "Write Latency (us)": 'writeLat',
+   "Write latency": 'avgWriteLat',
+   "Write rate": 'volWriteRate',
+   "Write request size": 'avgWrReqSz(bytes)',
+   "Write workload metric": 'Ignore'
+}
+
 
 def init_svc_inst():
     '''
@@ -91,14 +114,16 @@ def init_svc_inst():
 def init_perf():
    global perfm
    global perf_counters_map
-   
+
    init_svc_inst()
 
    # Create a map of performance counters that the performance
    # manager supports
    perf_counters = perfm.perfCounter
    for counter in perf_counters:
-      perf_counters_map[counter.key] = {'label': counter.nameInfo.label, 'summary': counter.nameInfo.summary}
+      perf_counters_map[counter.key] = {LABEL: counter.nameInfo.label,\
+                                        SUMMARY: counter.nameInfo.summary,\
+                                        UNIT_INFO:counter.unitInfo.label}
    return True
 
 def init_perf_for_vol(vm, bus, unit):
@@ -134,7 +159,7 @@ def delete_perf_for_vol(vm, bus, unit):
    device = "scsi{0}:{1}".format(bus, unit)
    if vm_name in vm_dev_map:
       vm_dev_map[vm_name][device] = None
-   
+
 def get_vol_stats(vm, bus, unit):
    # If the VM or the device was never initialized in the VM device map.
    vm_name = vm.config.name
@@ -145,7 +170,7 @@ def get_vol_stats(vm, bus, unit):
       not device in vm_dev_map[vm_name] or \
       not COUNTERS in vm_dev_map[vm_name][device]:
       # The daemon must have re-started, reinit
-      # the perf counter map for the VM and device 
+      # the perf counter map for the VM and device
       init_perf_for_vol(vm, bus, unit)
 
    metric_ids = []
@@ -175,11 +200,16 @@ def get_vol_stats(vm, bus, unit):
 
    # Build the response with label, summary and value for each counter
    perf_stats = {}
-   print(metrics)
    for metric in metrics[0].value:
-      label = perf_counters_map[metric.id.counterId][LABEL]
-      summary = perf_counters_map[metric.id.counterId][SUMMARY]
-      perf_stats[label] = {'value': metric.value, 'summary': summary}
+      perf_counter = perf_counters_map[metric.id.counterId]
+      label = metric_short_labels[perf_counter[LABEL]]
+      if perf_counter[UNIT_INFO] != NUM_TYPE:
+         label = '{0}({1})'.format(label, perf_counter[UNIT_INFO])
+
+      if label != IGN_TYPE:
+         perf_stats[label] = metric.value
+      #summary = perf_counters_map[metric.id.counterId][SUMMARY]
+      #perf_stats[label] = {'value': metric.value, 'summary': summary}
 
    return perf_stats
 
