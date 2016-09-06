@@ -202,14 +202,14 @@ def get_vol_stats(vm, bus, unit):
    perf_stats = {}
    for metric in metrics[0].value:
       perf_counter = perf_counters_map[metric.id.counterId]
-      label = metric_short_labels[perf_counter[LABEL]]
+      if perf_counter[LABEL] in metric_short_labels:
+         label = metric_short_labels[perf_counter[LABEL]]
       if perf_counter[UNIT_INFO] != NUM_TYPE:
          label = '{0}({1})'.format(label, perf_counter[UNIT_INFO])
 
       if label != IGN_TYPE:
          perf_stats[label] = metric.value
-      #summary = perf_counters_map[metric.id.counterId][SUMMARY]
-      #perf_stats[label] = {'value': metric.value, 'summary': summary}
 
    return perf_stats
+
 
