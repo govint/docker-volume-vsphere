@@ -151,7 +151,10 @@ def init_perf_for_vol(vm, bus, unit):
    for i in vm_metrics:
       if device == i.instance:
          counters += [i.counterId]
+   if not counters:
+      return False
    vm_dev_map[vm_name][device] = {COUNTERS: counters}
+   return True
 
 def delete_perf_for_vol(vm, bus, unit):
    # Remove the metrics that were created earlier for this volume
@@ -171,7 +174,8 @@ def get_vol_stats(vm, bus, unit):
       not COUNTERS in vm_dev_map[vm_name][device]:
       # The daemon must have re-started, reinit
       # the perf counter map for the VM and device
-      init_perf_for_vol(vm, bus, unit)
+      if not init_perf_for_vol(vm, bus, unit):
+         return None
 
    metric_ids = []
    for counter in vm_dev_map[vm_name][device][COUNTERS]:
