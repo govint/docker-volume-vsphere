@@ -66,22 +66,22 @@ si = None
 
 # Metric short names
 metric_short_labels = {
-   "Average number of outstanding read requests": 'avgInProgReads',
-   "Average number of outstanding write requests": 'avgInProgWrites',
+   "Average number of outstanding read requests": 'avgInProgRds',
+   "Average number of outstanding write requests": 'avgInProgWrs',
    "Average read requests per second": 'avgRd/s',
    "Average write requests per second": 'avgWr/s',
-   "Number of large seeks": 'largeSeekCnt (more than 8192 lbns)',
-   "Number of medium seeks": 'mediumSeekCnt(64 - 8192 lbns)',
-   "Number of small seeks": 'smallSeekCnt(less than 64 lbns)',
-   "Read Latency (us)": 'readLat',
-   "Read latency": 'avgReadLat',
-   "Read rate": 'volReadRate',
-   "Read request size": 'avgRdReqSz(bytes)',
+   "Number of large seeks": 'largeSeeks(>8192 lbns)',
+   "Number of medium seeks": 'medSeeks(64 - 8192 lbns)',
+   "Number of small seeks": 'smallSeeks(<64 lbns)',
+   "Read Latency (us)": 'rdLat',
+   "Read latency": 'avgRdLat',
+   "Read rate": 'volRdRate',
+   "Read request size": 'avgRdRqSz(bytes)',
    "Read workload metric": 'Ignore',
-   "Write Latency (us)": 'writeLat',
-   "Write latency": 'avgWriteLat',
-   "Write rate": 'volWriteRate',
-   "Write request size": 'avgWrReqSz(bytes)',
+   "Write Latency (us)": 'wrLat',
+   "Write latency": 'avgWrLat',
+   "Write rate": 'volWrRate',
+   "Write request size": 'avgWrRqSz(bytes)',
    "Write workload metric": 'Ignore'
 }
 
