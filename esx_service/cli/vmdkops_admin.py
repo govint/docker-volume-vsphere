@@ -36,7 +36,8 @@ NOT_AVAILABLE = 'N/A'
 def main():
     kv.init()
     args = parse_args()
-    args.func(args)
+    if args:
+       args.func(args)
 
 
 def commands():
@@ -117,7 +118,8 @@ def commands():
                 '-c': {
                     'help': 'Display selected columns',
                     'choices': ['volume', 'datastore', 'created-by', 'created',
-                                'attached-to', 'policy', 'capacity', 'used'],
+                                'attached-to', 'policy', 'capacity', 'used',
+                                'fstype', 'access', 'attach-as'],
                     'metavar': 'Col1,Col2,...'
                 }
             }
@@ -261,7 +263,7 @@ def commands():
             'help': 'Edit settings for a given volume',
             'args': {
                 '--volume': {
-                    'help': 'Full path of the volume',
+                    'help': 'Volume to set options for, specified as "volume@datastore".',
                     'required': True
                 },
                 '--options': {
@@ -306,7 +308,11 @@ def build_argparse_opts(opts):
 
 def parse_args():
     parser = create_parser()
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args != argparse.Namespace():
+       return args
+    else:
+       parser.print_help()
 
 
 def comma_seperated_string(string):
@@ -369,8 +375,8 @@ def ls_dash_c(columns):
 def all_ls_headers():
     """ Return a list of all header for ls -l """
     return ['Volume', 'Datastore', 'Created By VM', 'Created',
-            'Attached To VM', 'Policy', 'Capacity', 'Used']
-
+            'Attached To VM', 'Policy', 'Capacity', 'Used',
+            'Filesystem Type', 'Access', 'Attach As']
 
 def generate_ls_rows():
     """ Gather all volume metadata into rows that can be used to format a table """
@@ -383,8 +389,12 @@ def generate_ls_rows():
         policy = get_policy(metadata, path)
         size_info = get_vmdk_size_info(path)
         created, created_by = get_creation_info(metadata)
+        fstype = get_fstype(metadata)
+        access = get_access(metadata)
+        attach_as = get_attach_as(metadata)
         rows.append([name, v['datastore'], created_by, created, attached_to,
-                     policy, size_info['capacity'], size_info['used']])
+                     policy, size_info['capacity'], size_info['used'],
+                     fstype, access, attach_as])
     return rows
 
 
@@ -405,6 +415,20 @@ def get_attached_to(metadata):
     except:
         return kv.DETACHED
 
+def get_attach_as(metadata):
+    """ Return which mode a volume is attached as based on its metadata """
+    try:
+        return metadata[kv.VOL_OPTS][kv.ATTACH_AS]
+    except:
+        return kv.DEFAULT_ATTACH_AS
+
+
+def get_access(metadata):
+    """ Return the access mode of a volume based on its metadata """
+    try:
+       return metadata[kv.VOL_OPTS][kv.ACCESS]
+    except:
+        return kv.DEFAULT_ACCESS
 
 def get_policy(metadata, path):
     """ Return the policy for a volume given its volume options """
@@ -416,6 +440,14 @@ def get_policy(metadata, path):
     if vsan_info.is_on_vsan(path):
         return kv.DEFAULT_VSAN_POLICY
     else:
+        return NOT_AVAILABLE
+
+
+def get_fstype(metadata):
+    """ Return the Filesystem Type of the volume based on its metadata """
+    try:
+        return metadata[kv.VOL_OPTS][kv.FILESYSTEM_TYPE]
+    except:
         return NOT_AVAILABLE
 
 
@@ -439,7 +471,8 @@ def get_vmdk_size_info(path):
     try:
         cmd = "vmkfstools --extendedstatinfo {0}".format(path).split()
         output = subprocess.check_output(cmd)
-        lines = output.split('\n')
+        result = output.decode('utf-8')
+        lines = result.split('\n')
         capacity_in_bytes = lines[0].split()[2]
         used_in_bytes = lines[1].split()[2]
         return {'capacity': human_readable(int(capacity_in_bytes)),
@@ -530,10 +563,13 @@ def status(args):
 
 
 def set_vol_opts(args):
-    set_ok = vmdk_ops.edit_vol_opts(args.volume, args.options) 
-    if set_ok:
-        print('Successfully updated settings for : {0}'.format(args.volume))
-    else:
+    try:
+        set_ok = vmdk_ops.set_vol_opts(args.volume, args.options) 
+        if set_ok:
+           print('Successfully updated settings for : {0}'.format(args.volume))
+        else:
+           print('Failed to update {0} for {1}.'.format(args.options, args.volume))
+    except Exception as ex:
         print('Failed to update {0} for {1}.'.format(args.options, args.volume))
 
 
