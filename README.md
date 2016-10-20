@@ -8,7 +8,7 @@ This repo hosts the Docker Volume Driver for vSphere. Docker Volume Driver enabl
 To read more about code development and testing please read
 [CONTRIBUTING.md](https://github.com/vmware/docker-volume-vsphere/blob/master/CONTRIBUTING.md) 
 as well as the 
-[FAQ on the wiki](https://github.com/vmware/docker-volume-vsphere/wiki#faq).
+[FAQ on the project site](https://vmware.github.io/docker-volume-vsphere/user-guide/faq/).
 
 ## Download
 
@@ -18,14 +18,14 @@ The download consists of 2 parts
 
 1. ESX: The ESX code is packaged as a [vib or an offline depot] (http://pubs.vmware.com/vsphere-60/index.jsp#com.vmware.vsphere.install.doc/GUID-29491174-238E-4708-A78F-8FE95156D6A3.html#GUID-29491174-238E-4708-A78F-8FE95156D6A3)
 2. VM Running Docker: The docker plugin is packaged as a deb or rpm file.
-   * Photon => Download RPM
+   * Photon/RedHat => Download RPM
    * Ubuntu => Download Deb.
 
 Please pick the latest release and use the same version of ESX and VM release.
 
 ## Demos
 
-The demos are located on the project [wiki](https://github.com/vmware/docker-volume-vsphere/wiki/Demos)
+The demos are located on the project [site](https://vmware.github.io/docker-volume-vsphere/) and [wiki](https://github.com/vmware/docker-volume-vsphere/wiki/Demos)
 
 ## Project Website
 
@@ -142,7 +142,7 @@ Guest Operating System:
 - RedHat and CentOS
 
 # Known Issues
-1. Operations are serialized. Thus, if a large volume is created, other operations will block till the format is complete. [#35](/../../issues/35)
+1. Operations are serialized. Thus, when large volume is formatted, all plugin operations on the same Docker engine will be serialized behind it. [#35](/../../issues/35)
 2. VM level snapshots do not include docker data volumes. [#60](/../../issues/60)
 3. Exiting bug in Docker around cleanup if mounting of volume fails when -w command is passed. [Docker Issue #22564] (https://github.com/docker/docker/issues/22564)
 4. VIB, RPM and Deb files are not signed.[#273](/../../issues/273)
@@ -157,3 +157,22 @@ Guest Operating System:
 
 ### Internal
 * [VMware Internal Slack] (https://vmware.slack.com/archives/docker-volume-vsphere) 
+
+# Blogs
+
+- Cormac Hogan
+    - Overview
+        - [Docker Volume Driver for vSphere](http://cormachogan.com/2016/06/01/docker-volume-driver-vsphere/)
+        - [Docker Volume Driver for vSphere – short video](http://cormachogan.com/2016/06/03/docker-volume-driver-vsphere-short-video/)
+    - Docker + VSAN
+        - [Docker Volume Driver for vSphere on Virtual SAN](http://cormachogan.com/2016/06/09/docker-volume-driver-vsphere-virtual-san-vsan/)
+        - [Using vSphere docker volume driver to run Project Harbor on VSAN](http://cormachogan.com/2016/07/29/using-vsphere-docker-volume-driver-run-project-harbor-vsan/)
+        - [Docker Volume Driver for vSphere using policies on VSAN](http://cormachogan.com/2016/09/26/docker-volume-driver-vsphere-using-policies-vsan-short-video/)
+    - 0.7 Release Overview
+        - [Some nice enhancements to Docker Volume Driver for vSphere v0.7](http://cormachogan.com/2016/10/06/nice-enhancements-docker-volume-driver-vsphere-v0-7/)
+- William Lam
+    - [Getting Started with Tech Preview of Docker Volume Driver for vSphere - updated](http://www.virtuallyghetto.com/2016/05/getting-started-with-tech-preview-of-docker-volume-driver-for-vsphere.html)
+- Virtual Blocks
+    - [vSphere Docker Volume Driver Brings Benefits of vSphere Storage to Containers](https://blogs.vmware.com/virtualblocks/2016/06/20/vsphere-docker-volume-driver-brings-benefits-of-vsphere-storage-to-containers/)
+- Ryan Kelly
+    - [How to use the Docker Volume Driver for vSphere with Photon OS](http://www.vmtocloud.com/how-to-use-the-docker-volume-driver-for-vsphere-with-photon-os/)

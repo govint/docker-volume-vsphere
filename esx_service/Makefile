@@ -26,8 +26,19 @@ PYLINT := /usr/bin/pylint
 # build places binaries here:
 BIN := ../build
 
-# VIB version is either set from outside, or includes git commit SHA
-PKG_VERSION ?= 0.1.TP-pre.$(shell git log --pretty=format:'%h' -n 1)
+# PKG_VERSION is either set externally as part of a build off a tag or
+# suffixed with a sha1 of the most recent commit to the prefix of the
+# most recent tag. Tagged builds use the externally defined version,
+# developer builds use last tagged release and sha1 of the most recent commit.
+# Format: <last tagged release>.<last commit hash> 
+PKG_VERSION ?= $(shell \
+	       git describe --tags `git rev-list --tags --max-count=1` \
+	       ).$(shell \
+	       git log --pretty=format:'%h' -n 1)
+
+# Release version needed for vib
+RELEASE_VERSION ?= 0.0.1
+
 VIB := vmware-esx-vmdkops-$(PKG_VERSION).vib
 OFFLINE_DEPOT := vmware-esx-vmdkops-$(PKG_VERSION).zip
 VIB_BIN  = $(BIN)/$(VIB)
@@ -55,9 +66,6 @@ INIT_SCRIPT := vmdk-opsd
 
 # Vib layout descriptor
 DESCRIPTOR := descriptor.xml
-
-# extra stuff to copy to vib
-TOOLS := tools/lin32/mkfs.ext4
 
 # vibauthor definitions
 VIBAUTHOR := vibauthor
@@ -91,7 +99,7 @@ build: $(VIB_BIN)
 
 # What goes where in payloads:
 TO_WDIR := $(DESCRIPTOR)
-TO_ESX_BIN := $(PY_SRC) $(PY_CLI) $(TOOLS)
+TO_ESX_BIN := $(PY_SRC) $(PY_CLI)
 TO_ESX_PY  := $(PY_UTILS)
 TO_ESX_LIB := $(VMCI_SRV_LIBS)
 TO_ESX_INITD := $(INIT_SCRIPT)
@@ -100,13 +108,14 @@ TO_ESX_INITD := $(INIT_SCRIPT)
 $(VIB_BIN): $(TO_WDIR) $(TO_ESX_BIN) $(TO_ESX_PY) $(TO_ESX_LIB) $(TO_ESX_INITD)
 	@echo Staging in $(PAYLOAD)
 	@mkdir -p $(VMDKOPS_BIN) $(VMDKOPS_PY) $(VMDKOPS_LIB) $(VMDKOPS_LIB64) $(VMDKOPS_INITD)
-	@chmod -R a+w $(PAYLOAD)
-	@cp $(TO_WDIR) $(WDIR)
+	@chmod -R u+w $(PAYLOAD)
 	@cp $(TO_ESX_BIN) $(VMDKOPS_BIN)
 	@cp $(TO_ESX_PY)  $(VMDKOPS_PY)
 	@cp $(VMCI_SRV_LIB) $(VMDKOPS_LIB)/$(VMCI_SRV_LIB_NAME)
 	@cp $(VMCI_SRV_LIB64) $(VMDKOPS_LIB64)/$(VMCI_SRV_LIB_NAME)
 	@cp $(TO_ESX_INITD) $(VMDKOPS_INITD)
+	@chmod -R u+x $(VMDKOPS_BIN)
+	@sed "s/   <version>1.0.0-0.0.1<\/version>/   <version>$(PKG_VERSION)-$(RELEASE_VERSION)<\/version>/g" $(TO_WDIR) > $(WDIR)/$(DESCRIPTOR)
 	$(VIBAUTHOR) $(VIBAUTHOR_PARAMS)
 
 
@@ -141,12 +150,16 @@ SCP := $(DEBUG) scp -r -q -o StrictHostKeyChecking=no
 TMP_LOC    := $(shell echo /tmp/vmdk_ops_unittest$$RANDOM)
 TEST_FILES := $(shell find . -name '*_test.py')
 
+# By default, we run all *_test.py. Use TEST_PATTERN to narrow the test set, e.g.
+# e.g. make test-esx TEST_PATTERN='*admin*'
+TEST_PATTERN := '*'
+
 test-esx:
 	@echo Copying files to $(ESX):$(TMP_LOC) and running .py unittests ...
 	$(SSH) root@$(ESX) 'mkdir -p $(TMP_LOC)'
 	$(SCP) $(TEST_FILES) $(TO_ESX_BIN) $(TO_ESX_PY) root@$(ESX):$(TMP_LOC)
 	$(SSH) root@$(ESX) \
-		'for i in $(TMP_LOC)/*_test.py ; \
+		'for i in $(TMP_LOC)/$(TEST_PATTERN)_test.py ; \
 				do echo Running unit tests in $$i... ; python $$i ; \
 				status=$$((status + $$?)) ;\
 		done; \

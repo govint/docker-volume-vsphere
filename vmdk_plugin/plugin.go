@@ -112,7 +112,7 @@ func (d *vmdkDriver) List(r volume.Request) volume.Response {
 // Request attach and them mounts the volume.
 // Actual mount - send attach to ESX and do the in-guest magic
 // Returns mount point and  error (or nil)
-func (d *vmdkDriver) mountVolume(name string, isReadOnly bool) (string, error) {
+func (d *vmdkDriver) mountVolume(name string, fstype string, isReadOnly bool) (string, error) {
 	mountpoint := getMountPoint(name)
 
 	// First, make sure  that mountpoint exists.
@@ -150,7 +150,7 @@ func (d *vmdkDriver) mountVolume(name string, isReadOnly bool) (string, error) {
 	}
 
 	if d.useMockEsx {
-		return mountpoint, fs.Mount(mountpoint, "ext4", string(dev[:]), false)
+		return mountpoint, fs.Mount(mountpoint, fstype, string(dev[:]), false)
 	}
 
 	device, err := fs.GetDevicePath(dev)
@@ -160,7 +160,7 @@ func (d *vmdkDriver) mountVolume(name string, isReadOnly bool) (string, error) {
 
 	if skipInotify {
 		time.Sleep(sleepBeforeMount)
-		return mountpoint, fs.Mount(mountpoint, "ext2", device, false)
+		return mountpoint, fs.Mount(mountpoint, fstype, device, false)
 	}
 loop:
 	for {
@@ -187,7 +187,7 @@ loop:
 		}
 	}
 
-	return mountpoint, fs.Mount(mountpoint, "ext2", device, isReadOnly)
+	return mountpoint, fs.Mount(mountpoint, fstype, device, isReadOnly)
 }
 
 // Unmounts the volume and then requests detach
@@ -208,12 +208,92 @@ func (d *vmdkDriver) unmountVolume(name string) error {
 // (until Mount is called).
 // Name and driver specific options passed through to the ESX host
 func (d *vmdkDriver) Create(r volume.Request) volume.Response {
-	err := d.ops.Create(r.Name, r.Options)
-	if err != nil {
-		log.WithFields(log.Fields{"name": r.Name, "error": err}).Error("Create volume failed ")
-		return volume.Response{Err: err.Error()}
+
+	// Use default fstype if not specified
+	if _, result := r.Options["fstype"]; result == false {
+		r.Options["fstype"] = fs.FstypeDefault
 	}
-	log.WithFields(log.Fields{"name": r.Name}).Info("Volume created ")
+
+	// Get existent filesystem tools
+	supportedFs := fs.MkfsLookup()
+
+	// Verify the existence of fstype mkfs
+	mkfscmd, result := supportedFs[r.Options["fstype"]]
+	if result == false {
+		msg := "Not found mkfs for " + r.Options["fstype"]
+		msg += "\nSupported filesystems found: "
+		validfs := ""
+		for fs := range supportedFs {
+			if validfs != "" {
+				validfs += ", " + fs
+			} else {
+				validfs += fs
+			}
+		}
+		log.WithFields(log.Fields{"name": r.Name,
+			"fstype": r.Options["fstype"]}).Error("Not found ")
+		return volume.Response{Err: msg + validfs}
+	}
+
+	errCreate := d.ops.Create(r.Name, r.Options)
+	if errCreate != nil {
+		log.WithFields(log.Fields{"name": r.Name, "error": errCreate}).Error("Create volume failed ")
+		return volume.Response{Err: errCreate.Error()}
+	}
+
+	// Handle filesystem creation
+	log.WithFields(log.Fields{"name": r.Name,
+		"fstype": r.Options["fstype"]}).Info("Attaching volume and creating filesystem ")
+
+	dev, errAttach := d.ops.Attach(r.Name, nil)
+	if errAttach != nil {
+		log.WithFields(log.Fields{"name": r.Name,
+			"error": errAttach}).Error("Attach volume failed, removing the volume ")
+		errRemove := d.ops.Remove(r.Name, nil)
+		if errRemove != nil {
+			log.WithFields(log.Fields{"name": r.Name, "error": errRemove}).Warning("Remove volume failed ")
+		}
+		return volume.Response{Err: errAttach.Error()}
+	}
+
+	device, errGetDevicePath := fs.GetDevicePath(dev)
+	if errGetDevicePath != nil {
+		log.WithFields(log.Fields{"name": r.Name,
+			"error": errGetDevicePath}).Error("Could not find attached device, removing the volume ")
+		errDetach := d.ops.Detach(r.Name, nil)
+		if errDetach != nil {
+			log.WithFields(log.Fields{"name": r.Name, "error": errDetach}).Warning("Detach volume failed ")
+		}
+		errRemove := d.ops.Remove(r.Name, nil)
+		if errRemove != nil {
+			log.WithFields(log.Fields{"name": r.Name, "error": errRemove}).Warning("Remove volume failed ")
+		}
+		return volume.Response{Err: errGetDevicePath.Error()}
+	}
+
+	errMkfs := fs.Mkfs(mkfscmd, r.Name, device)
+	if errMkfs != nil {
+		log.WithFields(log.Fields{"name": r.Name,
+			"error": errMkfs}).Error("Create filesystem failed, removing the volume ")
+		errDetach := d.ops.Detach(r.Name, nil)
+		if errDetach != nil {
+			log.WithFields(log.Fields{"name": r.Name, "error": errDetach}).Warning("Detach volume failed ")
+		}
+		errRemove := d.ops.Remove(r.Name, nil)
+		if errRemove != nil {
+			log.WithFields(log.Fields{"name": r.Name, "error": errRemove}).Warning("Remove volume failed ")
+		}
+		return volume.Response{Err: errMkfs.Error()}
+	}
+
+	errDetach := d.ops.Detach(r.Name, nil)
+	if errDetach != nil {
+		log.WithFields(log.Fields{"name": r.Name, "error": errDetach}).Error("Detach volume failed ")
+		return volume.Response{Err: errDetach.Error()}
+	}
+
+	log.WithFields(log.Fields{"name": r.Name,
+		"fstype": r.Options["fstype"]}).Info("Volume and filesystem created ")
 	return volume.Response{Err: ""}
 }
 
@@ -281,7 +361,7 @@ func (d *vmdkDriver) Mount(r volume.MountRequest) volume.Response {
 		isReadOnly = true
 	}
 
-	mountpoint, err := d.mountVolume(r.Name, isReadOnly)
+	mountpoint, err := d.mountVolume(r.Name, status["fstype"].(string), isReadOnly)
 	if err != nil {
 		log.WithFields(
 			log.Fields{"name": r.Name, "error": err.Error()},

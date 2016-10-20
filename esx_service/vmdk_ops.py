@@ -85,7 +85,6 @@ PYTHON64_VERSION = 50659824
 # External tools used by the plugin.
 OBJ_TOOL_CMD = "/usr/lib/vmware/osfs/bin/objtool open -u "
 OSFS_MKDIR_CMD = "/usr/lib/vmware/osfs/bin/osfs-mkdir -n "
-MKFS_CMD = BIN_LOC + "/mkfs.ext4 -qF -L "
 VMDK_CREATE_CMD = "/sbin/vmkfstools"
 VMDK_DELETE_CMD = "/sbin/vmkfstools -U "
 
@@ -163,7 +162,8 @@ def createVMDK(vmdk_path, vm_name, vol_name, opts={}):
         removeVMDK(vmdk_path)
         return err(msg)
 
-    return formatVmdk(vmdk_path, vol_name)
+    backing, needs_cleanup = get_backing_device(vmdk_path)
+    cleanup_backing_device(backing, needs_cleanup)
 
 
 def make_create_cmd(opts, vmdk_path):
@@ -207,10 +207,11 @@ def validate_opts(opts, vmdk_path):
      * vsan-policy-name - The name of an existing policy to use
      * diskformat - The allocation format of allocated disk
     """
-    valid_opts = [kv.SIZE, kv.VSAN_POLICY_NAME, kv.DISK_ALLOCATION_FORMAT, kv.ATTACH_AS, kv.ACCESS]
+    valid_opts = [kv.SIZE, kv.VSAN_POLICY_NAME, kv.DISK_ALLOCATION_FORMAT,
+                kv.ATTACH_AS, kv.ACCESS, kv.FILESYSTEM_TYPE]
     defaults = [kv.DEFAULT_DISK_SIZE, kv.DEFAULT_VSAN_POLICY,\
                 kv.DEFAULT_ALLOCATION_FORMAT, kv.DEFAULT_ATTACH_AS,\
-                kv.DEFAULT_ACCESS]
+                kv.DEFAULT_ACCESS, kv.DEFAULT_FILESYSTEM_TYPE]
     invalid = frozenset(opts.keys()).difference(valid_opts)
     if len(invalid) != 0:
         msg = 'Invalid options: {0} \n'.format(list(invalid)) \
@@ -346,33 +347,6 @@ def cleanup_backing_device(backing, cleanup_device):
     	return cleanup_vsan_devfs_path(backing)
     return True
 
-def formatVmdk(vmdk_path, vol_name):
-    # Get backing for given vmdk path. This is the backing
-    # device that will be formatted.
-    backing, needs_cleanup = get_backing_device(vmdk_path)
-
-    if backing is None:
-        logging.warning("Failed to format %s.", vmdk_path)
-        return err("Failed to format %s." % vmdk_path)
-
-    # Format it as ext4.
-    cmd = "{0} {1} {2}".format(MKFS_CMD, vol_name, backing)
-    rc, out = RunCommand(cmd)
-
-    # clean up any resources backing file might have created
-    # during get_backing_device function call.
-    cleanup_backing_device(backing, needs_cleanup)
-
-    if rc != 0:
-        logging.warning("Failed to format %s - %s", vmdk_path, out)
-        if removeVMDK(vmdk_path) == None:
-            return err("Failed to format %s." % vmdk_path)
-        else:
-            return err(
-                "Unable to format %s and unable to delete volume. Please delete it manually."
-                % vmdk_path)
-    return None
-
 # Return volume ingo
 def vol_info(vol_meta, vol_size_info, bus_number, unit, datastore):
     vinfo = {CREATED_BY_VM : vol_meta[kv.CREATED_BY],
@@ -386,12 +360,11 @@ def vol_info(vol_meta, vol_size_info, bus_number, unit, datastore):
 
     if kv.ATTACHED_VM_NAME in vol_meta:
        vinfo[ATTACHED_TO_VM] = vol_meta[kv.ATTACHED_VM_NAME]
-       # Add IO stats for the volume
-       vm = findVmByUuid(vol_meta[kv.ATTACHED_VM_UUID])
-       vinfo[perf.IO_STATS] = perf.get_vol_stats(vm, bus_number, unit)
     if kv.VOL_OPTS in vol_meta:
+       if kv.FILESYSTEM_TYPE in vol_meta[kv.VOL_OPTS]:
+          vinfo[kv.FILESYSTEM_TYPE] = vol_meta[kv.VOL_OPTS][kv.FILESYSTEM_TYPE]   
        if kv.VSAN_POLICY_NAME in vol_meta[kv.VOL_OPTS]:
-          vinfo[kv.kv.VSAN_POLICY_NAME] = vol_meta[kv.VOL_OPTS][kv.VSAN_POLICY_NAME]
+          vinfo[kv.VSAN_POLICY_NAME] = vol_meta[kv.VOL_OPTS][kv.VSAN_POLICY_NAME]
        if kv.DISK_ALLOCATION_FORMAT in vol_meta[kv.VOL_OPTS]:
           vinfo[kv.DISK_ALLOCATION_FORMAT] = vol_meta[kv.VOL_OPTS][kv.DISK_ALLOCATION_FORMAT]
        else:
@@ -436,9 +409,15 @@ def getVMDK(vmdk_path, vol_name, vm_uuid, datastore):
         bus_number = device.controllerKey - 1000
         unit = device.unitNumber
 
-    return vol_info(kv.getAll(vmdk_path), kv.get_vol_info(vmdk_path),
-                    bus_number, unit, datastore)
 
+    try:
+        result = vol_info(kv.getAll(vmdk_path), kv.get_vol_info(vmdk_path),
+                    bus_number, unit, datastore)
+    except:
+        msg = "Failed to get disk details for %s" % vmdk_path
+        logging.error(msg)
+        result = msg
+    return result
 
 def listVMDK(vm_datastore):
     """
@@ -677,7 +656,7 @@ def get_controller_pci_slot(vm, pvscsi, key_offset):
     else:
        # Slot number is got from from the VM config
        key = 'scsi{0}.pciSlotNumber'.format(pvscsi.key -
-                                            key_offset)
+                                            key_offset)                
        slot = [cfg for cfg in vm.config.extraConfig \
                if cfg.key == key]
        # If the given controller exists
@@ -952,7 +931,7 @@ def disk_attach(vmdk_path, vm):
                  d.key == controller_key]
         pci_slot_number = get_controller_pci_slot(vm, pvsci[0],
                                                   offset_from_bus_number)
-        logging.info("Added a PVSCSI controller, controller_key=%d pci_slot_number=%d",
+        logging.info("Added a PVSCSI controller, controller_key=%d pci_slot_number=%s",
                       controller_key, pci_slot_number)
     
     # add disk as independent, so it won't be snapshotted with the Docker VM
@@ -1043,30 +1022,70 @@ def disk_detach_int(vmdk_path, vm, device):
 
 
 # Edit settings for a volume identified by its full path
-def set_vol_opts(vmdk_path, options):
+def set_vol_opts(name, options):
     # Create a dict of the options, the options are provided as
     # "access=read-only" and we get a dict like {'access': 'read-only'}
     opts_list = "".join(options.replace("=", ":").split())
     opts = dict(i.split(":") for i in opts_list.split(","))
 
-    # For now only allow resetting the access mode.
-    valid_opts = [kv.ACCESS]
-    invalid = frozenset(opts.keys()).difference(valid_opts)
+    # create volume path
+    try:
+       vol_name, datastore = parse_vol_name(name)
+    except ValidationError as ex:
+       logging.exception(ex)
+       return False
+
+    if not datastore:
+       msg = "Invalid datastore '{0}'.\n".format(datastore)
+       logging.warning(msg)
+       return False
+
+    # get /vmfs/volumes/<datastore>/dockvols path on ESX:
+    path = get_vol_path(datastore)
+
+    if path is None:
+       msg = "Failed to get datastore path {0}".format(path)
+       logging.warning(msg)
+       return False
+
+    vmdk_path = vmdk_utils.get_vmdk_path(path, vol_name)
+
+    if not os.path.isfile(vmdk_path):
+       msg = 'Volume {0} not found.'.format(vol_name)
+       logging.warning(msg)
+       return False
+   
+    # For now only allow resetting the access and attach-as options.
+    valid_opts = {
+        kv.ACCESS : kv.ACCESS_TYPES,
+        kv.ATTACH_AS : kv.ATTACH_AS_TYPES
+    }
+
+    invalid = frozenset(opts.keys()).difference(valid_opts.keys())
     if len(invalid) != 0:
         msg = 'Invalid options: {0} \n'.format(list(invalid)) \
                + 'Options that can be edited: ' \
                + '{0}'.format(list(valid_opts))
         raise ValidationError(msg)
 
-    if not opts[kv.ACCESS] in kv.ACCESS_TYPES:
-       msg = 'Invalid option value {0}.\n'.format(opts[kv.ACCESS]) +\
-             'Supported values are {0}.\n'.format(kv.ACCESS_TYPES)
-       logging.warning(msg)
-       return False
-
+    has_invalid_opt_value = False   
+    for key in opts.keys():
+        if key in valid_opts:
+            if not opts[key] in valid_opts[key]:
+                msg = 'Invalid option value {0}.\n'.format(opts[key]) +\
+                    'Supported values are {0}.\n'.format(valid_opts[key])
+                logging.warning(msg)
+                has_invalid_opt_value = True
+                
+    if has_invalid_opt_value:
+        return False   
+    
     vol_meta = kv.getAll(vmdk_path)
     if vol_meta:
-       vol_meta[kv.VOL_OPTS][kv.ACCESS] = opts[kv.ACCESS]
+       if not vol_meta[kv.VOL_OPTS]:
+           vol_meta[kv.VOL_OPTS] = {} 
+       for key in opts.keys():
+           vol_meta[kv.VOL_OPTS][key] = opts[key]
        return kv.setAll(vmdk_path, vol_meta)
 
     return False
