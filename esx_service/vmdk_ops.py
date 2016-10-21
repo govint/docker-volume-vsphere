@@ -513,6 +513,9 @@ def vol_info(vol_meta, vol_size_info, bus_number, unit, datastore):
        vm = findVmByUuid(vol_meta[kv.ATTACHED_VM_UUID])
        if vm:
           vinfo[ATTACHED_TO_VM] = vm.config.name
+          # Add IO stats for the volume
+          vm = findVmByUuid(vol_meta[kv.ATTACHED_VM_UUID])
+          vinfo[perf.IO_STATS] = perf.get_vol_stats(vm, bus_number, unit)
     if kv.VOL_OPTS in vol_meta:
        if kv.FILESYSTEM_TYPE in vol_meta[kv.VOL_OPTS]:
           vinfo[kv.FILESYSTEM_TYPE] = vol_meta[kv.VOL_OPTS][kv.FILESYSTEM_TYPE]
