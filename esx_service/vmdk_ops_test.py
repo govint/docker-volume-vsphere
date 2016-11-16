@@ -32,6 +32,9 @@ import vsan_info
 import vmdk_utils
 from pyVim import connect
 from pyVmomi import vim
+import uuid
+import auth
+import auth_data
 
 
 # will do creation/deletion in this folder:
@@ -288,7 +291,6 @@ class ValidationTestCase(unittest.TestCase):
             with self.assertRaises(vmdk_ops.ValidationError):
                 vmdk_ops.validate_opts(opts, self.path)
 
-    
 class VmdkAttachDetachTestCase(unittest.TestCase):
     """ Unit test for VMDK Attach and Detach ops """
 
@@ -297,12 +299,12 @@ class VmdkAttachDetachTestCase(unittest.TestCase):
     max_vol_count = 60
     datastore_path = None
     datastore_name = None
-    
+
     def setUp(self):
         """ Setup run before each test """
         logging.debug("VMDKAttachDetachTest setUp path =%s", path)
         self.cleanup()
-        
+
         if (not self.datastore_name):
             datastores = vmdk_utils.get_datastores()
             datastore = datastores[0]
@@ -315,10 +317,8 @@ class VmdkAttachDetachTestCase(unittest.TestCase):
                                                                  self.datastore_path)   
         
         # get service_instance, and create a VM
-        if not vmdk_ops.si:
-            vmdk_ops.connectLocal()
-
-        self.create_vm(vmdk_ops.si, self.vm_name, self.datastore_name)
+        si = vmdk_ops.get_si()
+        self.create_vm(si, self.vm_name, self.datastore_name)
 
         # create max_vol_count+1 VMDK files
         for id in range(1, self.max_vol_count+2):
@@ -392,9 +392,8 @@ class VmdkAttachDetachTestCase(unittest.TestCase):
     
     def cleanup(self):
         # remove VM
-        if not vmdk_ops.si:
-            vmdk_ops.connectLocal()
-        self.remove_vm(vmdk_ops.si, self.vm_name)
+        si = vmdk_ops.get_si()
+        self.remove_vm(si, self.vm_name)
 
         for v in self.get_testvols():
             self.assertEqual(
@@ -403,17 +402,15 @@ class VmdkAttachDetachTestCase(unittest.TestCase):
 
     def get_testvols(self):
         return [x
-                for x in vmdk_utils.get_volumes()
+                for x in vmdk_utils.get_volumes(None)
                 if x['filename'].startswith('VmdkAttachDetachTestVol')]
 
     
     def testAttachDetach(self):
         logging.debug("Start VMDKAttachDetachTest")
-
-        if not vmdk_ops.si:
-            vmdk_ops.connectLocal()
+        si = vmdk_ops.get_si()
         #find test_vm
-        vm = [d for d in vmdk_ops.si.content.rootFolder.childEntity[0].vmFolder.childEntity 
+        vm = [d for d in si.content.rootFolder.childEntity[0].vmFolder.childEntity 
               if d.config.name == self.vm_name]
         self.assertNotEqual(None, vm)
 
@@ -439,15 +436,118 @@ class VmdkAttachDetachTestCase(unittest.TestCase):
             ret = vmdk_ops.disk_detach(vmdk_path=fullpath,
                                        vm=vm[0])
             self.assertTrue(ret is None)
+
+class VmdkAuthorizeTestCase(unittest.TestCase):
+    """ Unit test for VMDK Authorization """
+    
+    vm_name = 'test-vm'
+    vm_uuid = str(uuid.uuid4())
         
+    def setUp(self):
+        self.auth_mgr = auth_data.AuthorizationDataManager()
+        self.auth_mgr.connect()
+
+    def test_vmdkop_authorize(self):
+        vm_ds = 'datastore1'
+        vms = [(self.vm_uuid, self.vm_name)]
+        privileges = []
+        default_datastore='default_ds'
+        default_privileges = {'datastore': default_datastore,
+                        'global_visibility': 0,
+                        'create_volume': 0,
+                        'delete_volume': 0,
+                        'mount_volume': 0,
+                        'max_volume_size': 0,
+                        'usage_quota': 0}
+                
+        error_info, tenant1 = self.auth_mgr.create_tenant('vmdk_auth_test', 'Tenant used to vmdk_auth_test', default_datastore,
+                                              default_privileges, vms, privileges)
+        self.assertEqual(error_info, None)
+        self.assertTrue(uuid.UUID(tenant1.id))
+
+        # test CMD_CREATE without "create_volume" set
+        privileges = [{'datastore': vm_ds,
+                        'global_visibility': 0,
+                        'create_volume': 0,
+                        'delete_volume': 0,
+                        'mount_volume': 1,
+                        'max_volume_size': 500,
+                        'usage_quota': 1000}]
+        
+        error_info = tenant1.set_datastore_access_privileges(self.auth_mgr.conn, privileges)
+        self.assertEqual(error_info, None)
+        opts={u'size': u'100MB', u'fstype': u'ext4'}
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_CREATE, opts)
+        self.assertEqual(error_info, "No create privilege" )
+
+        # set "create_volume" privilege to true 
+        privileges = [{'datastore': vm_ds,
+                        'global_visibility': 0,
+                        'create_volume': 1,
+                        'delete_volume': 0,
+                        'mount_volume': 1,
+                        'max_volume_size': 500,
+                        'usage_quota': 1000}]
+
+        error_info = tenant1.set_datastore_access_privileges(self.auth_mgr.conn, privileges)
+        self.assertEqual(error_info, None)
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_CREATE, opts)
+        self.assertEqual(error_info, None)
+
+        if not error_info:
+            error_info = auth.add_volume_to_volumes_table(tenant1.id, vm_ds, "VmdkAuthorizeTestVol1", 100)
+            self.assertEqual(error_info, None)
+
+        opts={u'size': u'600MB', u'fstype': u'ext4'}
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_CREATE, opts)
+        # create a volume with 600MB which exceed the"max_volume_size", command should fail
+        self.assertEqual(error_info, "volume size exceeds the max volume size limit") 
+
+        opts={u'size': u'500MB', u'fstype': u'ext4'}
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_CREATE, opts)
+        self.assertEqual(error_info, None)
+
+        if not error_info:
+            error_info = auth.add_volume_to_volumes_table(tenant1.id, vm_ds, "VmdkAuthorizeTestVol2", 500)
+            self.assertEqual(error_info, None)
+        
+        opts={u'size': u'500MB', u'fstype': u'ext4'}
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_CREATE, opts)
+        self.assertEqual(error_info, "The total volume size exceeds the usage quota")
+
+        # delete volume
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_REMOVE, opts)
+        self.assertEqual(error_info, "No delete privilege")
+
+        privileges = [{'datastore': vm_ds,
+                        'global_visibility': 0,
+                        'create_volume': 1,
+                        'delete_volume': 1,
+                        'mount_volume': 1,
+                        'max_volume_size': 500,
+                        'usage_quota': 1000}]
+
+        error_info = tenant1.set_datastore_access_privileges(self.auth_mgr.conn, privileges)
+        self.assertEqual(error_info, None)
+
+        error_info, tenant_uuid, tenant_name = auth.authorize(self.vm_uuid, vm_ds, auth.CMD_REMOVE, opts)
+        self.assertEqual(error_info, None)
+
+        # remove the tenant
+        error_info = self.auth_mgr.remove_tenant(tenant1.id, False)
+        self.assertEqual(error_info, None)
+        error_info = self.auth_mgr.remove_volumes_from_volume_table(tenant1.id)
+        self.assertEqual(error_info, None)        
                                                   
     
 if __name__ == '__main__':
+    # configure the log, find the dir and run the tests
     log_config.configure()
     volume_kv.init()
 
     # Calculate the path
     paths = glob.glob("/vmfs/volumes/[a-zA-Z]*/dockvols")
+    logging.info("Found datastores: %s", paths)
     if paths:
         # WARNING: for many datastores with dockvols, this picks up the first
         path = paths[0]
@@ -457,16 +557,24 @@ if __name__ == '__main__':
         logging.debug("Directory does not exist - creating %s", path)
         os.makedirs(path)
 
-    logging.info("Directory used in test - %s", path)
+    def clean_path(path):
+        if not path:
+            logging.info("Directory clean up - empty dir passed")
+            return
 
+        logging.info("Directory clean up - removing  %s", path)
+        try:
+            # TODO: need to use osfs-rmdir on VSAN. For now jus yell if it failed
+            os.removedirs(path)
+        except Exception as e:
+            logging.warning("Directory clean up failed  -  %s, err: %s", path, e)
+
+    logging.info("Running tests. Directory used: %s", path)
     try:
         unittest.main()
     except:
-        pass
-    finally:
-        if not paths:
-            logging.debug("Directory clean up - removing  %s", path)
-            os.removedirs(path)
-
-        # If the unittest failed, re-raise the error
+        clean_path(path)
+         # If the unittest failed, re-raise the error
         raise
+
+    clean_path(path)

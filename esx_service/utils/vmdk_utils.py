@@ -20,7 +20,8 @@ import os.path
 import glob
 import re
 import logging
-import pyVim.connect
+import fnmatch
+import vmdk_ops
 
 # datastores should not change during 'vmdkops_admin' run,
 # so using global to avoid multiple scans of /vmfs/volumes
@@ -39,6 +40,38 @@ SPECIAL_FILES_REGEXP = r"\A.*-(delta|ctk|digest|flat)\.vmdk$"
 # glob expression to match end of 'delta' (aka snapshots) file names.
 SNAP_SUFFIX_GLOB = "-[0-9][0-9][0-9][0-9][0-9][0-9].vmdk"
 
+def init_datastoreCache():
+    """
+    Initializes the datastore cache with the list of datastores accessible from local ESX host.
+    """
+    global datastores
+    logging.debug("init_datastoreCache: %s", datastores)
+
+    si = vmdk_ops.get_si()
+
+    #  We are connected to ESX so childEntity[0] is current DC/Host
+    ds_objects = \
+      si.content.rootFolder.childEntity[0].datastoreFolder.childEntity
+    datastores = [(d.info.name,
+                   os.path.split(d.info.url)[1],
+                   os.path.join(d.info.url, 'dockvols'))
+                  for d in ds_objects]
+
+def validate_datastore(datastore):
+    """
+    Checks if the datastore is part of datastoreCache. 
+    If not it will update the datastore cache and checks if datastore is part of the updated cache.
+    """
+    global datastores
+    if datastores == None:
+        init_datastoreCache()
+    if datastore in [i[0] for i in datastores]:
+        return True
+    else:
+        init_datastoreCache()
+        if datastore in [i[0] for i in datastores]:
+            return True
+    return False
 
 def get_datastores():
     """
@@ -48,31 +81,50 @@ def get_datastores():
     'url-name' is the last element of datastore URL (e.g. 'vsan:572904f8c031435f-3513e0db551fcc82')
     'dockvol-path; is a full path to 'dockvols' folder on datastore 
     """
-
-    global datastores
-    if datastores != None:
-        return datastores
-
-    si = pyVim.connect.Connect()
-    #  We are connected to ESX so childEntity[0] is current DC/Host
-    ds_objects = \
-      si.content.rootFolder.childEntity[0].datastoreFolder.childEntity
-    datastores = [(d.info.name,
-                   os.path.split(d.info.url)[1],
-                   os.path.join(d.info.url, 'dockvols'))
-                  for d in ds_objects]
-    pyVim.connect.Disconnect(si)
-
+    if datastores == None:
+        init_datastoreCache()
     return datastores
 
-def get_volumes():
-    """ Return dicts of docker volumes, their datastore and their paths """
+def get_volumes(tenant_re):
+    """ Return dicts of docker volumes, their datastore and their paths 
+        
+        
+    """
+    # Assume we have two tenants "tenant1" and "tenant2"
+    # volumes belongs to "tenant1" are under /vmfs/volumes/datastore1/dockervol/tenant1 
+    # volumes belongs to "tenant2" are under /vmfs/volumes/datastore1/dockervol/tenant2
+    # volumes does not belongs to any tenants are under /vmfs/volumes/dockervol
+    # tenant_re = None : only return volumes which does not belong to any tenant
+    # tenant_re = "tenant1" : only return volumes which belongs to tenant1
+    # tenant_re = "tenant*" : return volumes which belongs to tenant1 or tenant2
+    # tenant_re = "*" : return all volumes under /vmfs/volumes/datastore1/dockervol
+    logging.debug("get_volumes: tenant_pattern(%s)", tenant_re)
     volumes = []
     for (datastore, url_name, path) in get_datastores():
-        for file_name in list_vmdks(path):
-            volumes.append({'path': path,
-                            'filename': file_name,
-                            'datastore': datastore})
+        logging.debug("get_volumes: %s %s %s", datastore, url_name, path)
+        if not tenant_re:
+            for file_name in list_vmdks(path):
+                # path : docker_vol path
+                volumes.append({'path': path,
+                                'filename': file_name,
+                                'datastore': datastore})
+        else:
+            for root, dirs, files in os.walk(path):
+                # walkthough all files under docker_vol path
+                # root is the current directory which is traversing
+                #  root = /vmfs/volumes/datastore1/dockervol/tenant1
+                #  path = /vmfs/volumes/datastore1/dockervol
+                #  sub_dir get the string "/tenant1"
+                #  sub_dir_name is "tenant1" which will be used to match
+                #  pattern specified by tenant_re
+                sub_dir = root.replace(path, "")
+                sub_dir_name = sub_dir[1:]
+                if fnmatch.fnmatch(sub_dir_name, tenant_re):
+                    for file_name in list_vmdks(root):
+                        volumes.append({'path': root,
+                                        'filename': file_name,
+                                        'datastore': datastore})
+    logging.debug("volumes %s", volumes)
     return volumes
 
 
@@ -113,7 +165,7 @@ def list_vmdks(path, volname="", show_snapshots=False):
     # dockvols may not exists on a datastore - this is normal.
     if not os.path.exists(path):
         return []
-
+    logging.debug("list_vmdks: dockvol existed on datastore")
     vmdks = [f for f in os.listdir(path) if vmdk_is_a_descriptor(path, f)]
     if volname:
         vmdks = [f for f in vmdks if f.startswith(volname)]
@@ -121,7 +173,7 @@ def list_vmdks(path, volname="", show_snapshots=False):
     if not show_snapshots:
         expr =  re.compile(SNAP_VMDK_REGEXP)
         vmdks = [f for f in vmdks if not expr.match(f)]
-    
+    logging.debug("vmdks %s", vmdks)
     return vmdks
 
 
@@ -153,3 +205,13 @@ def vmdk_is_a_descriptor(path, file_name):
 def strip_vmdk_extension(filename):
     """ Remove the .vmdk file extension from a string """
     return filename.replace(".vmdk", "")
+
+def get_vm_uuid_by_name(vm_name):
+    """Returns vm_uuid for given vm_name, or None"""
+    si = vmdk_ops.get_si()
+    try:
+        vm = [d for d in si.content.rootFolder.childEntity[0].vmFolder.childEntity if d.config.name == vm_name]
+        return vm[0].config.uuid
+    except:
+        return None
+

@@ -30,7 +30,7 @@ BIN := ../build
 # suffixed with a sha1 of the most recent commit to the prefix of the
 # most recent tag. Tagged builds use the externally defined version,
 # developer builds use last tagged release and sha1 of the most recent commit.
-# Format: <last tagged release>.<last commit hash> 
+# Format: <last tagged release>.<last commit hash>
 PKG_VERSION ?= $(shell \
 	       git describe --tags `git rev-list --tags --max-count=1` \
 	       ).$(shell \
@@ -51,7 +51,8 @@ VMCI_SRV_LIBS  := $(VMCI_SRV_LIB) $(VMCI_SRV_LIB64)
 
 # Source code - all .py stuff which is not tests
 PY_SRC   := $(filter-out %_test.py, $(wildcard *.py))
-PY_CLI   := $(filter-out %_test.py, $(wildcard cli/*.py))
+# exclude __init__.py to avoid clash with __init__.py from parent
+PY_CLI   := $(filter-out %_test.py, $(wildcard cli/[a-z]*.py))
 PY_UTILS := $(filter-out %_test.py, $(wildcard utils/*.py))
 
 C_SRC  := vmci/vmci_server.c
@@ -76,9 +77,9 @@ VIBAUTHOR_PARAMS := --debug --compose \
 	--stage-dir $(WDIR) \
 	--offline-depot $(BIN)/$(OFFLINE_DEPOT) \
 	--force
-	
 
-# Payload root 
+
+# Payload root
 PAYLOAD=$(WDIR)/payloads
 
 # Location on ESX where the stuff needs to go
@@ -89,35 +90,56 @@ ESX_LOC := /usr/lib/vmware/vmdkops
 VMDKOPS_PAYLOAD := $(PAYLOAD)/vmdkops
 VMDKOPS_BIN     := $(VMDKOPS_PAYLOAD)$(ESX_LOC)/bin
 VMDKOPS_PY      := $(VMDKOPS_PAYLOAD)$(ESX_LOC)/Python
+VMDKOPS_PY2     := $(VMDKOPS_PAYLOAD)$(ESX_LOC)/Python/2
 VMDKOPS_LIB     := $(VMDKOPS_PAYLOAD)$(ESX_LOC)/lib
 VMDKOPS_LIB64   := $(VMDKOPS_PAYLOAD)$(ESX_LOC)/lib64
 VMDKOPS_INITD   := $(VMDKOPS_PAYLOAD)/etc/init.d
+
+# build the docker-volume-plugin
+
+UI_FROM := ../ui/build/dist/*
+UI_TO_BASE := $(VMDKOPS_PAYLOAD)/usr/lib/vmware
+UI_TO_HOSTD := /hostd/docroot/ui/plugins/docker-volume-plugin/
+UI_TO := $(UI_TO_BASE)$(UI_TO_HOSTD)
 
 # this is used from a Makefile upstairs, and could be used manually
 .PHONY: build
 build: $(VIB_BIN)
 
-# What goes where in payloads:
+# What needs to be placed in payloads:
 TO_WDIR := $(DESCRIPTOR)
 TO_ESX_BIN := $(PY_SRC) $(PY_CLI)
 TO_ESX_PY  := $(PY_UTILS)
 TO_ESX_LIB := $(VMCI_SRV_LIBS)
 TO_ESX_INITD := $(INIT_SCRIPT)
 
+
+# SQLITE python libs. We need that on ESX before 6.0 U2
+PY_SQLITE := tools/sqlite/sqlite3
+SO_SQLITE := tools/sqlite/*.so
+
 # copy files to staging area and then build the VIB
-$(VIB_BIN): $(TO_WDIR) $(TO_ESX_BIN) $(TO_ESX_PY) $(TO_ESX_LIB) $(TO_ESX_INITD)
+$(VIB_BIN): $(TO_WDIR) $(TO_ESX_BIN) $(TO_ESX_PY) $(TO_ESX_LIB) $(TO_ESX_INITD) $(PY_SQLITE) $(SO_SQLITE)
 	@echo Staging in $(PAYLOAD)
-	@mkdir -p $(VMDKOPS_BIN) $(VMDKOPS_PY) $(VMDKOPS_LIB) $(VMDKOPS_LIB64) $(VMDKOPS_INITD)
+ifeq ($(INCLUDE_UI), true)
+	@mkdir -p $(VMDKOPS_BIN) $(VMDKOPS_PY) $(VMDKOPS_PY2) $(VMDKOPS_LIB) $(VMDKOPS_LIB64) $(VMDKOPS_INITD) $(UI_TO)
+else
+	@mkdir -p $(VMDKOPS_BIN) $(VMDKOPS_PY) $(VMDKOPS_PY2) $(VMDKOPS_LIB) $(VMDKOPS_LIB64) $(VMDKOPS_INITD)
+endif
 	@chmod -R u+w $(PAYLOAD)
-	@cp $(TO_ESX_BIN) $(VMDKOPS_BIN)
-	@cp $(TO_ESX_PY)  $(VMDKOPS_PY)
-	@cp $(VMCI_SRV_LIB) $(VMDKOPS_LIB)/$(VMCI_SRV_LIB_NAME)
-	@cp $(VMCI_SRV_LIB64) $(VMDKOPS_LIB64)/$(VMCI_SRV_LIB_NAME)
-	@cp $(TO_ESX_INITD) $(VMDKOPS_INITD)
+	cp $(TO_ESX_BIN) $(VMDKOPS_BIN)
+	cp $(TO_ESX_PY)  $(VMDKOPS_PY)
+	cp -R $(PY_SQLITE) $(VMDKOPS_PY2)
+ifeq ($(INCLUDE_UI), true)
+	cp -R $(UI_FROM) $(UI_TO)
+endif
+	cp $(SO_SQLITE) $(VMDKOPS_PY2)
+	cp $(VMCI_SRV_LIB) $(VMDKOPS_LIB)/$(VMCI_SRV_LIB_NAME)
+	cp $(VMCI_SRV_LIB64) $(VMDKOPS_LIB64)/$(VMCI_SRV_LIB_NAME)
+	cp $(TO_ESX_INITD) $(VMDKOPS_INITD)
 	@chmod -R u+x $(VMDKOPS_BIN)
 	@sed "s/   <version>1.0.0-0.0.1<\/version>/   <version>$(PKG_VERSION)-$(RELEASE_VERSION)<\/version>/g" $(TO_WDIR) > $(WDIR)/$(DESCRIPTOR)
 	$(VIBAUTHOR) $(VIBAUTHOR_PARAMS)
-
 
 $(VMCI_SRV_LIB): $(C_SRC)
 	$(CC) $(CFLAGS) -o $@ $(C_SRC)
@@ -144,8 +166,8 @@ test: test-esx build
 
 # test-esx is a quick unittest for ESX Python code.
 # Deploys, runs and clean unittests (i.e. all files *_test.py) on ESX
-SSH := $(DEBUG) ssh -kTax -o StrictHostKeyChecking=no
-SCP := $(DEBUG) scp -r -q -o StrictHostKeyChecking=no
+SSH := $(DEBUG) ssh $(SSH_KEY_OPT) -kTax -o StrictHostKeyChecking=no
+SCP := $(DEBUG) scp $(SSH_KEY_OPT) -r -q -o StrictHostKeyChecking=no
 
 TMP_LOC    := $(shell echo /tmp/vmdk_ops_unittest$$RANDOM)
 TEST_FILES := $(shell find . -name '*_test.py')
@@ -155,7 +177,7 @@ TEST_FILES := $(shell find . -name '*_test.py')
 TEST_PATTERN := '*'
 
 test-esx:
-	@echo Copying files to $(ESX):$(TMP_LOC) and running .py unittests ...
+	@echo "Copying files to $(ESX):$(TMP_LOC) and running .py unittests ..."
 	$(SSH) root@$(ESX) 'mkdir -p $(TMP_LOC)'
 	$(SCP) $(TEST_FILES) $(TO_ESX_BIN) $(TO_ESX_PY) root@$(ESX):$(TMP_LOC)
 	$(SSH) root@$(ESX) \

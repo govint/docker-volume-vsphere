@@ -28,6 +28,8 @@ PKG_VERSION ?= $(shell \
 	       git log --pretty=format:'%h' -n 1)
 
 export PKG_VERSION
+export INCLUDE_UI
+
 EPOCH := 0
 
 # Place binaries here
@@ -133,9 +135,13 @@ $(BIN)/$(PLUGNAME).test: $(SRC) *_test.go
 	$(GO) test -c -o $@ $(PLUGIN)
 
 .PHONY: clean
-clean: pkg-post
+clean:
+	$(BUILD) clean-as-root
+
+.PHONY: clean-as-root
+clean-as-root: pkg-post
 	rm -rf $(BIN) .code_verify
-	$(MAKE) --directory=$(ESX_SRC) $@
+	$(MAKE) --directory=$(ESX_SRC) clean
 
 # GO Code quality checks.
 
@@ -243,7 +249,7 @@ TEST_VM = root@$(VM1)
 VM1_DOCKER = tcp://$(VM1):2375
 VM2_DOCKER = tcp://$(VM2):2375
 
-SSH := $(DEBUG) ssh -kTax -o StrictHostKeyChecking=no
+SSH := $(DEBUG) ssh $(SSH_KEY_OPT) -kTax -o StrictHostKeyChecking=no
 
 # bin locations on target guest
 TMP_LOC := /tmp/$(PLUGNAME)

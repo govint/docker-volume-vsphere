@@ -51,9 +51,17 @@ make documentation # Start the mkdocs docker image
 mkdocs serve -a 0.0.0.0:8000
 # 1. Open browser on same machine and head to 127.0.0.1:8000
 # 2. Make edits and refresh browser
-# 3. Publish changes to gh-pages branch
-# Example:
-mkdocs gh-deploy -c -m “Add documentation for feature XYZ” -b gh-pages
+# 3. Build the website
+mkdocs build
+# 4. Checkout the gh-pages
+git checkout gh-pages
+# 5. Remove the old site and copy the new one.
+rm -rvf documentation
+mv site documentation
+# 6. Push to GitHub
+git add documentation
+git commit
+git push origin gh-pages
 ```
 
 ## Bug filing guidelines
@@ -93,6 +101,13 @@ Docker Daemon running with "-H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock
 options. Note that both tcp: and unix: need to be present
 Please check  "Configuring and running Docker"
 (https://docs.docker.com/engine/admin/configuring/)  page on how to configure this - also there is a github link at the bottom, for systemd config files.
+
+If test environment has Docker running on Photon OS VMs, VMs should be configured to accept traffic on port 2375. Edit /etc/systemd/scripts/iptables, and add following rule at the end of the file. Restart iptable service after updating iptables file.
+
+```
+#Enable docker connections
+iptables -A INPUT -p tcp --dport 2375 -j ACCEPT
+```
 
 To deploy the plugin and test code onto a test environment we support a set of
 Makefile targets. There targets rely on environment variables to point to the

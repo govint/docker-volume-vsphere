@@ -62,15 +62,20 @@ BIN_LOC  = os.path.join(TOP_DIR, "bin")
 LIB_LOC  = os.path.join(TOP_DIR, "lib")
 LIB_LOC64 = os.path.join(TOP_DIR, "lib64")
 PY_LOC  = os.path.join(TOP_DIR, "Python")
+PY2_LOC = os.path.join(PY_LOC, "2")
 
 # We won't accept names longer than that
 MAX_VOL_NAME_LEN = 100
 MAX_DS_NAME_LEN  = 100
 
-# vmdkops python utils are in PY_LOC, so add to path.
+# vmdkops python utils are in PY_LOC, so insert to path ahead of other stuff
 sys.path.insert(0, PY_LOC)
 
+# if we are on Python 2, add py2-only stuff as a fallback
+if sys.version_info.major == 2:
+    sys.path.append(PY2_LOC)
 
+import threadutils
 import log_config
 import volume_kv as kv
 import vmdk_utils
@@ -78,6 +83,9 @@ import vsan_policy
 import vsan_info
 import vmdk_perf as perf
 
+import auth
+import sqlite3
+import convert
 
 # Python version 3.5.1
 PYTHON64_VERSION = 50659824
@@ -85,13 +93,22 @@ PYTHON64_VERSION = 50659824
 # External tools used by the plugin.
 OBJ_TOOL_CMD = "/usr/lib/vmware/osfs/bin/objtool open -u "
 OSFS_MKDIR_CMD = "/usr/lib/vmware/osfs/bin/osfs-mkdir -n "
+MKDIR_CMD = "/bin/mkdir"
 VMDK_CREATE_CMD = "/sbin/vmkfstools"
 VMDK_DELETE_CMD = "/sbin/vmkfstools -U "
+
+# For retries on vmkfstools
+VMDK_RETRY_COUNT = 5
+VMDK_RETRY_SLEEP = 1
 
 # Defaults
 DOCK_VOLS_DIR = "dockvols"  # place in the same (with Docker VM) datastore
 MAX_JSON_SIZE = 1024 * 4  # max buf size for query json strings. Queries are limited in size
 MAX_SKIP_COUNT = 16       # max retries on VMCI Get Ops failures
+
+# Error codes
+VMCI_ERROR = -1 # VMCI C code uses '-1' to indicate failures
+ECONNABORTED = 103 # Error on non privileged client
 
 # Volume data returned on Get request
 CAPACITY = 'capacity'
@@ -108,10 +125,13 @@ VM_POWERED_OFF = "poweredOff"
 PVSCSI_MAX_TARGETS = 16
 
 # Service instance provide from connection to local hostd
-si = None
+_service_instance = None
 
 # VMCI library used to communicate with clients
 lib = None
+
+# For managing resource locks.
+lockManager = threadutils.LockManager()
 
 # Run executable on ESX as needed for vmkfstools invocation (until normal disk create is written)
 # Returns the integer return value and the stdout str on success and integer return value and
@@ -318,7 +338,7 @@ def cleanup_vsan_devfs_path(devfs_path):
         logging.debug("Unlinked %s", devfs_path)
         return True
     except OSError as ex:
-        logging.error("Failed to remove backing device %s",
+        logging.error("Failed to remove backing device %s, err %s",
                       devfs_path, str(ex))
     return False
 
@@ -344,7 +364,7 @@ def get_backing_device(vmdk_path):
 
 def cleanup_backing_device(backing, cleanup_device):
     if cleanup_device:
-    	return cleanup_vsan_devfs_path(backing)
+        return cleanup_vsan_devfs_path(backing)
     return True
 
 # Return volume ingo
@@ -358,11 +378,13 @@ def vol_info(vol_meta, vol_size_info, bus_number, unit, datastore):
     vinfo[CAPACITY][ALLOCATED] = vol_size_info[ALLOCATED]
     vinfo[LOCATION] = datastore
 
-    if kv.ATTACHED_VM_NAME in vol_meta:
-       vinfo[ATTACHED_TO_VM] = vol_meta[kv.ATTACHED_VM_NAME]
+    if kv.ATTACHED_VM_UUID in vol_meta:
+       vm = findVmByUuid(vol_meta[kv.ATTACHED_VM_UUID])
+       if vm:
+          vinfo[ATTACHED_TO_VM] = vm.config.name
     if kv.VOL_OPTS in vol_meta:
        if kv.FILESYSTEM_TYPE in vol_meta[kv.VOL_OPTS]:
-          vinfo[kv.FILESYSTEM_TYPE] = vol_meta[kv.VOL_OPTS][kv.FILESYSTEM_TYPE]   
+          vinfo[kv.FILESYSTEM_TYPE] = vol_meta[kv.VOL_OPTS][kv.FILESYSTEM_TYPE]
        if kv.VSAN_POLICY_NAME in vol_meta[kv.VOL_OPTS]:
           vinfo[kv.VSAN_POLICY_NAME] = vol_meta[kv.VOL_OPTS][kv.VSAN_POLICY_NAME]
        if kv.DISK_ALLOCATION_FORMAT in vol_meta[kv.VOL_OPTS]:
@@ -384,12 +406,32 @@ def vol_info(vol_meta, vol_size_info, bus_number, unit, datastore):
 # Return error, or None for OK
 def removeVMDK(vmdk_path):
     logging.info("*** removeVMDK: %s", vmdk_path)
-    cmd = "{0} {1}".format(VMDK_DELETE_CMD, vmdk_path)
-    rc, out = RunCommand(cmd)
-    if rc != 0:
-        return err("Failed to remove %s. %s" % (vmdk_path, out))
 
-    return None
+    # Check the current volume status
+    kv_status_attached, kv_uuid, attach_mode = getStatusAttached(vmdk_path)
+    if kv_status_attached:
+        if handle_stale_attach(vmdk_path, kv_uuid):
+            logging.info("*** removeVMDK: %s is in use, VM uuid = %s", vmdk_path, kv_uuid)
+            return err("Failed to remove volume {0}, in use by VM uuid = {1}.".format(
+                vmdk_path, kv_uuid))
+
+    cmd = "{0} {1}".format(VMDK_DELETE_CMD, vmdk_path)
+    # Workaround timing/locking issues.
+    retry_count = 0
+    while True:
+        rc, out = RunCommand(cmd)
+        if rc != 0 and "lock" in out:
+            if retry_count == VMDK_RETRY_COUNT:
+                return err("Failed to remove %s. %s" % (vmdk_path, out))
+            logging.info("*** removeVMDK: %s, coudn't lock volume for removal. Retrying...",
+                         vmdk_path)
+            retry_count += 1
+            time.sleep(VMDK_RETRY_SLEEP)
+            continue
+        elif rc != 0:
+            return err("Failed to remove %s. %s" % (vmdk_path, out))
+        else:
+            return None
 
 
 def getVMDK(vmdk_path, vol_name, vm_uuid, datastore):
@@ -413,19 +455,19 @@ def getVMDK(vmdk_path, vol_name, vm_uuid, datastore):
     try:
         result = vol_info(kv.getAll(vmdk_path), kv.get_vol_info(vmdk_path),
                     bus_number, unit, datastore)
-    except:
-        msg = "Failed to get disk details for %s" % vmdk_path
-        logging.error(msg)
-        result = msg
+    except Exception as ex:
+        logging.error("Failed to get disk details for %s (%s)" % (vmdk_path, ex))
+        return None
+
     return result
 
-def listVMDK(vm_datastore):
+def listVMDK(vm_datastore, tenant):
     """
     Returns a list of volume names (note: may be an empty list).
     Each volume name is returned as either `volume@datastore`, or just `volume`
     for volumes on vm_datastore
     """
-    vmdks = vmdk_utils.get_volumes()
+    vmdks = vmdk_utils.get_volumes(tenant)
     # build  fully qualified vol name for each volume found
     return [{u'Name': get_full_vol_name(x['filename'], x['datastore'], vm_datastore),
              u'Attributes': {}} \
@@ -434,21 +476,8 @@ def listVMDK(vm_datastore):
 
 # Return VM managed object, reconnect if needed. Throws if fails twice.
 def findVmByUuid(vm_uuid):
-    vm = None
-    try:
-        vm = si.content.searchIndex.FindByUuid(None, vm_uuid, True, False)
-    except Exception as ex:
-        logging.warning("Failed to find VM by uuid=%s, retrying...\n%s",
-                        vm_uuid, str(ex))
-    if vm:
-        return vm
-    #
-    # Retry. It can throw if connect/search fails. But search can't return None
-    # since we get UUID from VMM so VM must exist
-    #
-    connectLocal()
+    si = get_si()
     vm = si.content.searchIndex.FindByUuid(None, vm_uuid, True, False)
-    logging.info("Found VM name=%s, id=%s ", vm.config.name, vm_uuid)
     return vm
 
 
@@ -469,29 +498,41 @@ def detachVMDK(vmdk_path, vm_uuid):
 
 
 # Check existence (and creates if needed) the path for docker volume VMDKs
-def get_vol_path(datastore):
-    # The folder for Docker volumes is created on <datastore>/DOCK_VOLS_DIR
-    path = os.path.join("/vmfs/volumes", datastore, DOCK_VOLS_DIR)
+def get_vol_path(datastore, tenant_name=None):
+    # If the command is NOT running under a tenant, the folder for Docker
+    # volumes is created on <datastore>/DOCK_VOLS_DIR
+    # If the command is running under a tenant, the foler for Dock volume
+    # is created on <datastore>/DOCK_VOLS_DIR/tenant_name
+    dock_vol_path = os.path.join("/vmfs/volumes", datastore, DOCK_VOLS_DIR)
+    if tenant_name:
+        path = os.path.join(dock_vol_path, tenant_name)
+    else:
+        path = dock_vol_path
 
     if os.path.isdir(path):
         # If the path exists then return it as is.
         logging.debug("Found %s, returning", path)
-        return path
+        return path, None
 
-    # The osfs tools are usable for all datastores
-    cmd = "{0} {1}".format(OSFS_MKDIR_CMD, path)
-    rc, out = RunCommand(cmd)
-    if rc == 0:
-        logging.info("Created %s", path)
-        return path
+    if not os.path.isdir(dock_vol_path):
+        # The osfs tools are usable for DOCK_VOLS_DIR on all datastores
+        cmd = "{0} {1}".format(OSFS_MKDIR_CMD, dock_vol_path)
+        rc, out = RunCommand(cmd)
+        if rc != 0:
+            errMsg = "{0} creation failed - {1} on {2}".format(DOCK_VOLS_DIR, os.strerror(rc), datastore)
+            logging.warning(errMsg)
+            return None, err(errMsg)
+    if tenant_name and not os.path.isdir(path):
+        # The mkdir command is used to create "tenant_name" folder inside DOCK_VOLS_DIR on "datastore"
+        cmd = "{0} {1}".format(MKDIR_CMD, path)
+        rc, out = RunCommand(cmd)
+        if rc != 0:
+            errMsg = "Failed to initialize volume path {0} - {1}".format(path, out)
+            logging.warning(errMsg)
+            return None, err(errMsg)
 
-    logging.warning("Failed to create %s", path)
-    return None
-
-
-def known_datastores():
-    """returns names of know datastores"""
-    return [i[0] for i in vmdk_utils.get_datastores()]
+    logging.info("Created %s", path)
+    return path, None
 
 def parse_vol_name(full_vol_name):
     """
@@ -558,10 +599,13 @@ def executeRequest(vm_uuid, vm_name, config_path, cmd, full_vol_name, opts):
 
     Returns None (if all OK) or error string
     """
-
     vm_datastore = get_datastore_name(config_path)
+    error_info, tenant_uuid, tenant_name = auth.get_tenant(vm_uuid)
+    if error_info:
+        return err(error_info)
+
     if cmd == "list":
-        return listVMDK(vm_datastore)
+        return listVMDK(vm_datastore, tenant_name)
 
     try:
         vol_name, datastore = parse_vol_name(full_vol_name)
@@ -569,17 +613,21 @@ def executeRequest(vm_uuid, vm_name, config_path, cmd, full_vol_name, opts):
         return err(str(ex))
     if not datastore:
         datastore = vm_datastore
-    elif datastore not in known_datastores():
+    elif not vmdk_utils.validate_datastore(datastore):
         return err("Invalid datastore '%s'.\n" \
-                   "Known datastores: %s.\n" \
-                   "Default datastore: %s" \
-                   % (datastore, ", ".join(known_datastores()), vm_datastore))
+                "Known datastores: %s.\n" \
+                "Default datastore: %s" \
+                % (datastore, ", ".join(get_datastore_names_list), vm_datastore))
+
+    error_info, tenant_uuid, tenant_name = auth.authorize(vm_uuid, datastore, cmd, opts)
+    if error_info:
+        return err(error_info)
 
     # get /vmfs/volumes/<volid>/dockvols path on ESX:
-    path = get_vol_path(datastore)
-
+    path, errMsg = get_vol_path(datastore, tenant_name)
+    logging.debug("executeRequest %s %s", tenant_name, path)
     if path is None:
-        return err("Failed to initialize volume path {0}".format(path))
+        return errMsg
 
     vmdk_path = vmdk_utils.get_vmdk_path(path, vol_name)
 
@@ -587,6 +635,14 @@ def executeRequest(vm_uuid, vm_name, config_path, cmd, full_vol_name, opts):
         response = getVMDK(vmdk_path, vol_name, vm_uuid, datastore)
     elif cmd == "create":
         response = createVMDK(vmdk_path, vm_name, vol_name, opts)
+        # create succeed, insert infomation of this volume to volumes table
+        if not response:
+            if tenant_uuid:
+                vol_size_in_MB = convert.convert_to_MB(auth.get_vol_size(opts))
+                auth.add_volume_to_volumes_table(tenant_uuid, datastore, vol_name, vol_size_in_MB)
+            else:
+                logging.warning(" VM %s does not belong to any tenant", vm_name)
+
     elif cmd == "remove":
         response = removeVMDK(vmdk_path)
     elif cmd == "attach":
@@ -598,26 +654,46 @@ def executeRequest(vm_uuid, vm_name, config_path, cmd, full_vol_name, opts):
 
     return response
 
-def connectLocal():
+def connectLocalSi(force=False):
     '''
-	connect and do stuff on local machine
+	Initialize a connection to the local SI
 	'''
-    global si  #
-
-    # Connect to localhost as dcui
-    # User "dcui" is a local Admin that does not lose permissions
-    # when the host is in lockdown mode.
-    si = pyVim.connect.Connect(host='localhost', user='dcui')
-    if not si:
-        raise SystemExit("Failed to connect to localhost as 'dcui'.")
-
-    atexit.register(pyVim.connect.Disconnect, si)
+    global _service_instance
+    if not _service_instance:
+        try:
+            logging.info("Connecting to the local Service Instance")
+            _service_instance = pyVim.connect.Connect(host='localhost', user='dcui')
+        except Exception as e:
+            logging.exception("Failed to the local Service Instance as 'dcui', exiting: ")
+            sys.exit(1)
+    elif force:
+        logging.warning("Reconnecting to the local Service Instance")
+        _service_instance = pyVim.connect.Connect(host='localhost', user='dcui')
 
     # set out ID in context to be used in request - so we'll see it in logs
     reqCtx = VmomiSupport.GetRequestContext()
     reqCtx["realUser"] = 'dvolplug'
-    return si
+    atexit.register(pyVim.connect.Disconnect, _service_instance)
 
+def get_si():
+    '''
+	Return a connection to the local SI
+	'''
+    with lockManager.get_lock('siLock'):
+        try:
+            _service_instance.CurrentTime()
+        except:
+            connectLocalSi(force=True)
+    return _service_instance
+
+def get_datastore_names_list():
+    """returns names of known datastores"""
+    return [i[0] for i in vmdk_utils.get_datastores()]
+
+def get_datastore_url(datastore):
+    si = get_si()
+    res = [d.info.url for d in si.content.rootFolder.childEntity[0].datastore if d.info.name == datastore]
+    return res[0]
 
 def findDeviceByPath(vmdk_path, vm):
     logging.debug("findDeviceByPath: Looking for device {0}".format(vmdk_path))
@@ -629,14 +705,23 @@ def findDeviceByPath(vmdk_path, vm):
         # The filename identifies the virtual disk by name and can be used
         # to match with the given volume name.
         # Filename format is as follows:
-        #   "[<datastore name>] <parent-directory>/<vmdk-descriptor-name>"
+        #   "[<datastore name>] <parent-directory>/tenant/<vmdk-descriptor-name>"
+        logging.debug("d.backing.fileName %s", d.backing.fileName)
         backing_disk = d.backing.fileName.split(" ")[1]
+
+        # datastore='[datastore name]'
+        datastore = d.backing.fileName.split(" ")[0]
+        datastore = datastore[1:-1]
 
         # Construct the parent dir and vmdk name, resolving
         # links if any.
         dvol_dir = os.path.dirname(vmdk_path)
-        real_vol_dir = os.path.basename(os.path.realpath(dvol_dir))
+        datastore_url = get_datastore_url(datastore)
+        datastore_prefix = os.path.realpath(datastore_url) + '/'
+        real_vol_dir = os.path.realpath(dvol_dir).replace(datastore_prefix, "")
         virtual_disk = os.path.join(real_vol_dir, os.path.basename(vmdk_path))
+        logging.debug("dvol_dir=%s datastore_prefix=%s real_vol_dir=%s", dvol_dir, datastore_prefix,real_vol_dir)
+        logging.debug("backing_disk=%s virtual_disk=%s", backing_disk, virtual_disk)
         if virtual_disk == backing_disk:
             logging.debug("findDeviceByPath: MATCH: %s", backing_disk)
             return d
@@ -656,7 +741,7 @@ def get_controller_pci_slot(vm, pvscsi, key_offset):
     else:
        # Slot number is got from from the VM config
        key = 'scsi{0}.pciSlotNumber'.format(pvscsi.key -
-                                            key_offset)                
+                                            key_offset)
        slot = [cfg for cfg in vm.config.extraConfig \
                if cfg.key == key]
        # If the given controller exists
@@ -676,14 +761,12 @@ def reset_vol_meta(vmdk_path):
     if not vol_meta:
        vol_meta = {}
     logging.debug("Reseting meta-data for disk=%s", vmdk_path)
-    if set(vol_meta.keys()) & {kv.STATUS, kv.ATTACHED_VM_UUID, kv.ATTACHED_VM_NAME}:
-          logging.debug("Old meta-data for %s was (status=%s VM name=%s uuid=%s)",
+    if set(vol_meta.keys()) & {kv.STATUS, kv.ATTACHED_VM_UUID}:
+          logging.debug("Old meta-data for %s was (status=%s VM uuid=%s)",
                         vmdk_path, vol_meta[kv.STATUS],
-                        vol_meta[kv.ATTACHED_VM_NAME],
                         vol_meta[kv.ATTACHED_VM_UUID])
     vol_meta[kv.STATUS] = kv.DETACHED
     vol_meta[kv.ATTACHED_VM_UUID] = None
-    vol_meta[kv.ATTACHED_VM_NAME] = None
     if not kv.setAll(vmdk_path, vol_meta):
        msg = "Failed to save volume metadata for {0}.".format(vmdk_path)
        logging.warning("reset_vol_meta: " + msg)
@@ -698,7 +781,6 @@ def setStatusAttached(vmdk_path, vm):
         vol_meta = {}
     vol_meta[kv.STATUS] = kv.ATTACHED
     vol_meta[kv.ATTACHED_VM_UUID] = vm.config.uuid
-    vol_meta[kv.ATTACHED_VM_NAME] = vm.config.name
     if not kv.setAll(vmdk_path, vol_meta):
         logging.warning("Attach: Failed to save Disk metadata for %s", vmdk_path)
 
@@ -713,7 +795,6 @@ def setStatusDetached(vmdk_path):
     # If attachedVMName is present, so is attachedVMUuid
     try:
         del vol_meta[kv.ATTACHED_VM_UUID]
-        del vol_meta[kv.ATTACHED_VM_NAME]
     except:
         pass
     if not kv.setAll(vmdk_path, vol_meta):
@@ -777,7 +858,7 @@ def handle_stale_attach(vmdk_path, kv_uuid):
              return ret
 
 def add_pvscsi_controller(vm, controllers, max_scsi_controllers, offset_from_bus_number):
-    ''' 
+    '''
     Add a new PVSCSI controller, return (controller_key, err) pair
     '''
     # find empty bus slot for the controller:
@@ -799,11 +880,12 @@ def add_pvscsi_controller(vm, controllers, max_scsi_controllers, offset_from_bus
     spec.deviceChange = pvscsi_change
 
     try:
+        si = get_si()
         wait_for_tasks(si, [vm.ReconfigVM_Task(spec=spec)])
     except vim.fault.VimFault as ex:
         msg=("Failed to add PVSCSI Controller: %s", ex.msg)
         return None, err(msg)
-    logging.debug("Added a PVSCSI controller, controller_id=%d", controller_key)    
+    logging.debug("Added a PVSCSI controller, controller_id=%d", controller_key)
     return controller_key, None
 
 def find_disk_slot_in_controller(vm, devices, pvsci, idx, offset_from_bus_number):
@@ -825,11 +907,11 @@ def find_disk_slot_in_controller(vm, devices, pvsci, idx, offset_from_bus_number
         disk_slot = avail_slots.pop()
         pci_slot_number = get_controller_pci_slot(vm, pvsci[idx],
                                                   offset_from_bus_number)
-                 
+
         logging.debug("Find an available slot: controller_key = %d slot = %d", controller_key, disk_slot)
     else:
         logging.warning("No available slot in this controller: controller_key = %d", controller_key)
-    return disk_slot        
+    return disk_slot
 
 def find_available_disk_slot(vm, devices, pvsci, offset_from_bus_number):
     '''
@@ -842,8 +924,8 @@ def find_available_disk_slot(vm, devices, pvsci, offset_from_bus_number):
             disk_slot = find_disk_slot_in_controller(vm, devices, pvsci, idx, offset_from_bus_number)
             if (disk_slot is None):
                 idx = idx + 1;
-    return idx, disk_slot            
-            
+    return idx, disk_slot
+
 def disk_attach(vmdk_path, vm):
     '''
     Attaches *existing* disk to a vm on a PVSCI controller
@@ -889,17 +971,17 @@ def disk_attach(vmdk_path, vm):
         pvsci = [d for d in controllers
                    if type(d) == vim.ParaVirtualSCSIController and
                       d.key == device.controllerKey]
-        
+
         return dev_info(device.unitNumber,
                         get_controller_pci_slot(vm, pvsci[0],
                                                 offset_from_bus_number))
-        
+
 
     # Disk isn't attached, make sure we have a PVSCI and add it if we don't
     # check if we already have a pvsci one
     pvsci = [d for d in controllers
              if type(d) == vim.ParaVirtualSCSIController]
-    disk_slot = None         
+    disk_slot = None
     if len(pvsci) > 0:
         idx, disk_slot = find_available_disk_slot(vm, devices, pvsci, offset_from_bus_number);
         if (disk_slot is not None):
@@ -908,7 +990,7 @@ def disk_attach(vmdk_path, vm):
                                                       offset_from_bus_number)
             logging.debug("Find an available disk slot, controller_key=%d, slot_id=%d",
                           controller_key, disk_slot)
-        
+
     if (disk_slot is None):
         disk_slot = 0  # starting on a fresh controller
         if len(controllers) >= max_scsi_controllers:
@@ -917,13 +999,13 @@ def disk_attach(vmdk_path, vm):
             return err(msg)
 
         logging.info("Adding a PVSCSI controller")
-        
-        controller_key, ret_err = add_pvscsi_controller(vm, controllers, max_scsi_controllers, 
+
+        controller_key, ret_err = add_pvscsi_controller(vm, controllers, max_scsi_controllers,
                                                         offset_from_bus_number)
 
         if (ret_err):
-            return ret_err    
-            
+            return ret_err
+
         # Find the controller just added
         devices = vm.config.hardware.device
         pvsci = [d for d in devices
@@ -933,7 +1015,7 @@ def disk_attach(vmdk_path, vm):
                                                   offset_from_bus_number)
         logging.info("Added a PVSCSI controller, controller_key=%d pci_slot_number=%s",
                       controller_key, pci_slot_number)
-    
+
     # add disk as independent, so it won't be snapshotted with the Docker VM
     disk_spec = vim.VirtualDeviceConfigSpec(
         operation='add',
@@ -954,6 +1036,7 @@ def disk_attach(vmdk_path, vm):
     spec.deviceChange = disk_changes
 
     try:
+        si = get_si()
         wait_for_tasks(si, [vm.ReconfigVM_Task(spec=spec)])
     except vim.fault.VimFault as ex:
         msg = ex.msg
@@ -996,6 +1079,7 @@ def disk_detach(vmdk_path, vm):
     return disk_detach_int(vmdk_path, vm, device)
 
 def disk_detach_int(vmdk_path, vm, device):
+    si = get_si()
     spec = vim.vm.ConfigSpec()
     dev_changes = []
 
@@ -1041,7 +1125,7 @@ def set_vol_opts(name, options):
        return False
 
     # get /vmfs/volumes/<datastore>/dockvols path on ESX:
-    path = get_vol_path(datastore)
+    path, errMsg = get_vol_path(datastore)
 
     if path is None:
        msg = "Failed to get datastore path {0}".format(path)
@@ -1054,7 +1138,7 @@ def set_vol_opts(name, options):
        msg = 'Volume {0} not found.'.format(vol_name)
        logging.warning(msg)
        return False
-   
+
     # For now only allow resetting the access and attach-as options.
     valid_opts = {
         kv.ACCESS : kv.ACCESS_TYPES,
@@ -1068,7 +1152,7 @@ def set_vol_opts(name, options):
                + '{0}'.format(list(valid_opts))
         raise ValidationError(msg)
 
-    has_invalid_opt_value = False   
+    has_invalid_opt_value = False
     for key in opts.keys():
         if key in valid_opts:
             if not opts[key] in valid_opts[key]:
@@ -1076,14 +1160,14 @@ def set_vol_opts(name, options):
                     'Supported values are {0}.\n'.format(valid_opts[key])
                 logging.warning(msg)
                 has_invalid_opt_value = True
-                
+
     if has_invalid_opt_value:
-        return False   
-    
+        return False
+
     vol_meta = kv.getAll(vmdk_path)
     if vol_meta:
        if not vol_meta[kv.VOL_OPTS]:
-           vol_meta[kv.VOL_OPTS] = {} 
+           vol_meta[kv.VOL_OPTS] = {}
        for key in opts.keys():
            vol_meta[kv.VOL_OPTS][key] = opts[key]
        return kv.setAll(vmdk_path, vol_meta)
@@ -1103,22 +1187,85 @@ def load_vmci():
    else:
        lib = CDLL(os.path.join(LIB_LOC, "libvmci_srv.so"), use_errno=True)
 
+
+def send_vmci_reply(client_socket, reply_string):
+    reply = json.dumps(reply_string)
+    response = lib.vmci_reply(client_socket, c_char_p(reply.encode()))
+    errno = get_errno()
+    logging.debug("lib.vmci_reply: VMCI replied with errcode %s", response)
+    if response == VMCI_ERROR:
+        logging.warning("vmci_reply returned error %s (errno=%d)",
+                        os.strerror(errno), errno)
+
+def execRequestThread(client_socket, cartel, request):
+    '''
+    Execute requests in a thread context with a per volume locking.
+    '''
+    # Before we start, block to allow main thread or other running threads to advance.
+    # https://docs.python.org/2/faq/library.html#none-of-my-threads-seem-to-run-why
+    time.sleep(0.001)
+    try:
+        # Get VM name & ID from VSI (we only get cartelID from vmci, need to convert)
+        vmm_leader = vsi.get("/userworld/cartel/%s/vmmLeader" % str(cartel))
+        group_info = vsi.get("/vm/%s/vmmGroupInfo" % vmm_leader)
+        vm_name = group_info["displayName"]
+        cfg_path = group_info["cfgPath"]
+        uuid = group_info["uuid"]
+        # pyVmomi expects uuid like this one: 564dac12-b1a0-f735-0df3-bceb00b30340
+        # to get it from uuid in VSI vms/<id>/vmmGroup, we use the following format:
+        UUID_FORMAT = "{0}{1}{2}{3}-{4}{5}-{6}{7}-{8}{9}-{10}{11}{12}{13}{14}{15}"
+        vm_uuid = UUID_FORMAT.format(*uuid.replace("-",  " ").split())
+
+        try:
+            req = json.loads(request.decode('utf-8'))
+        except ValueError as e:
+            reply_string = {u'Error': "Failed to parse json '%s'." % request}
+            send_vmci_reply(client_socket, reply_string)
+        else:
+            details = req["details"]
+            opts = details["Opts"] if "Opts" in details else {}
+
+            # Lock name defaults to volume name, or socket# if request has no volume defined
+            lockname = details["Name"] if len(details["Name"]) > 0 else "socket{0}".format(client_socket)
+            # Set thread name to vm_name-lockname
+            threading.currentThread().setName("{0}-{1}".format(vm_name, lockname))
+
+            # Get a resource lock
+            rsrcLock = lockManager.get_lock(lockname)
+
+            logging.debug("Trying to aquire lock: %s", lockname)
+            with rsrcLock:
+                logging.debug("Aquired lock: %s", lockname)
+
+                reply_string = executeRequest(vm_uuid=vm_uuid,
+                                    vm_name=vm_name,
+                                    config_path=cfg_path,
+                                    cmd=req["cmd"],
+                                    full_vol_name=details["Name"],
+                                    opts=opts)
+
+                logging.info("executeRequest '%s' completed with ret=%s", req["cmd"], reply_string)
+                send_vmci_reply(client_socket, reply_string)
+            logging.debug("Released lock: %s", lockname)
+
+    except Exception as ex_thr:
+        logging.exception("Unhandled Exception:")
+        reply_string = err("Server returned an error: {0}".format(repr(ex_thr)))
+        send_vmci_reply(client_socket, reply_string)
+
 # load VMCI shared lib , listen on vSocket in main loop, handle requests
 def handleVmciRequests(port):
-    VMCI_ERROR = -1 # VMCI C code uses '-1' to indicate failures
-    ECONNABORTED = 103 # Error on non privileged client
-
+    skip_count = MAX_SKIP_COUNT  # retries for vmci_get_one_op failures
     bsize = MAX_JSON_SIZE
     txt = create_string_buffer(bsize)
-
     cartel = c_int32()
     sock = lib.vmci_init(c_uint(port))
+
     if sock == VMCI_ERROR:
         errno = get_errno()
         raise OSError("Failed to initialize vSocket listener: %s (errno=%d)" \
                         %  (os.strerror(errno), errno))
 
-    skip_count = MAX_SKIP_COUNT  # retries for vmci_get_one_op failures
     while True:
         c = lib.vmci_get_one_op(sock, byref(cartel), txt, c_int(bsize))
         logging.debug("lib.vmci_get_one_op returns %d, buffer '%s'",
@@ -1140,43 +1287,11 @@ def handleVmciRequests(port):
         else:
             skip_count = MAX_SKIP_COUNT  # reset the counter, just in case
 
-        # Get VM name & ID from VSI (we only get cartelID from vmci, need to convert)
-        vmm_leader = vsi.get("/userworld/cartel/%s/vmmLeader" %
-                            str(cartel.value))
-        group_info = vsi.get("/vm/%s/vmmGroupInfo" % vmm_leader)
-
-        vm_name = group_info["displayName"]
-        cfg_path = group_info["cfgPath"]
-        uuid = group_info["uuid"]
-        # pyVmomi expects uuid like this one: 564dac12-b1a0-f735-0df3-bceb00b30340
-        # to get it from uuid in VSI vms/<id>/vmmGroup, we use the following format:
-        UUID_FORMAT = "{0}{1}{2}{3}-{4}{5}-{6}{7}-{8}{9}-{10}{11}{12}{13}{14}{15}"
-        vm_uuid = UUID_FORMAT.format(*uuid.replace("-",  " ").split())
-
-        try:
-            req = json.loads(txt.value.decode('utf-8'))
-        except ValueError as e:
-            ret = {u'Error': "Failed to parse json '%s'." % txt.value}
-        else:
-            details = req["details"]
-            opts = details["Opts"] if "Opts" in details else {}
-            threading.currentThread().setName(vm_name)
-            ret = executeRequest(vm_uuid=vm_uuid,
-                                 vm_name=vm_name,
-                                 config_path=cfg_path,
-                                 cmd=req["cmd"],
-                                 full_vol_name=details["Name"],
-                                 opts=opts)
-            logging.info("executeRequest '%s' completed with ret=%s",
-                         req["cmd"], ret)
-
-        ret_string = json.dumps(ret)
-        response = lib.vmci_reply(c, c_char_p(ret_string.encode()))
-        errno = get_errno()
-        logging.debug("lib.vmci_reply: VMCI replied with errcode %s", response)
-        if response == VMCI_ERROR:
-            logging.warning("vmci_reply returned error %s (errno=%d)",
-                            os.strerror(errno), errno)
+        client_socket = c # Bind to avoid race conditions.
+        # Fire a thread to execute the request
+        threading.Thread(
+            target=execRequestThread,
+            args=(client_socket, cartel.value, txt.value)).start()
 
     lib.close(sock)  # close listening socket when the loop is over
 
@@ -1208,7 +1323,7 @@ def main():
         load_vmci()
 
         kv.init()
-        connectLocal()
+        connectLocalSi()
         perf.init_perf()
         handleVmciRequests(port)
     except Exception as e:
@@ -1245,20 +1360,13 @@ Helper module for task operations.
 """
 
 
-def wait_for_tasks(service_instance, tasks):
+def wait_for_tasks(si, tasks):
     """Given the service instance si and tasks, it returns after all the
    tasks are complete
    """
     task_list = [str(task) for task in tasks]
-    property_collector = service_instance.content.propertyCollector
-    try:
-        pcfilter = getTaskList(property_collector, tasks)
-    except vim.fault.NotAuthenticated:
-        # Reconnect and retry
-        logging.warning("Reconnecting and retry")
-        connectLocal()
-        property_collector = si.content.propertyCollector
-        pcfilter = getTaskList(property_collector, tasks)
+    property_collector = si.content.propertyCollector
+    pcfilter = getTaskList(property_collector, tasks)
 
     try:
         version, state = None, None
