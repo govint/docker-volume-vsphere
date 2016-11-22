@@ -1,4 +1,4 @@
-[![Build Status](https://ci.vmware.run/api/badges/vmware/docker-volume-vsphere/status.svg)](https://ci.vmware.run/vmware/docker-volume-vsphere)
+[![Build Status](https://ci.vmware.run/api/badges/vmware/docker-volume-vsphere/status.svg)](https://ci.vmware.run/vmware/docker-volume-vsphere) [![Join the chat at https://gitter.im/vmware/docker-volume-vsphere](https://badges.gitter.im/vmware/docker-volume-vsphere.svg)](https://gitter.im/vmware/docker-volume-vsphere?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 vSphere Docker Volume Service
 ================================
@@ -153,9 +153,9 @@ Guest Operating System:
 ## Contact us
 
 ### Public
-* [cna-storage@vmware.com](cna-storage <cna-storage@vmware.com>)
-* [Telegram] (https://telegram.me/cnastorage)
+* [containers@vmware.com](cna-storage <containers@vmware.com>)
 * [Issues] (https://github.com/vmware/docker-volume-vsphere/issues)
+* [![Join the chat at https://gitter.im/vmware/docker-volume-vsphere](https://badges.gitter.im/vmware/docker-volume-vsphere.svg)](https://gitter.im/vmware/docker-volume-vsphere?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 ### Internal
 * [VMware Internal Slack] (https://vmware.slack.com/archives/docker-volume-vsphere)

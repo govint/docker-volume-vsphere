@@ -34,6 +34,7 @@ import auth
 import auth_data_const
 import convert
 import auth_data
+import auth_api
 
 NOT_AVAILABLE = 'N/A'
 
@@ -239,7 +240,7 @@ def commands():
                                 }
                             }
                         },
-                        
+
                         'rm': {
                             'help': 'Remove VM(s) from a tenant',
                             'func': tenant_vm_rm,
@@ -293,7 +294,7 @@ def commands():
                                     'metavar': 'Num{MB,GB,TB} - e.g. 2TB'
                                 },
                                 '--volume-totalsize': {
-                                    'help': 
+                                    'help':
                                     'Maximum total size of all volume that can be created on the datastore for this tenant',
                                     'metavar': 'Num{MB,GB,TB} - e.g. 2TB'
                                 }
@@ -315,7 +316,7 @@ def commands():
                                     'help': 'Datastore access Permissions granted',
                                     'choices': ['create', 'delete', 'mount', 'all'],
                                     'metavar': 'create,delete,mount,all'
-                                }, 
+                                },
                                 '--rm-rights': {
                                     'help': 'Datastore access Permissions removed',
                                     'choices': ['create', 'delete', 'mount', 'all'],
@@ -325,12 +326,8 @@ def commands():
                                     'help': 'Maximum size of the volume that can be created',
                                     'metavar': 'Num{MB,GB,TB} - e.g. 2TB'
                                 },
-                                '--volume-maxcount': {
-                                    'help': 
-                                    'Maximum number of volumes to create on the datastore for this tenant'
-                                },
                                 '--volume-totalsize': {
-                                    'help': 
+                                    'help':
                                     'Maximum total size of all volume that can be created on the datastore for this tenant',
                                     'metavar': 'Num{MB,GB,TB} - e.g. 2TB'
                                 }
@@ -442,9 +439,9 @@ def make_list_of_values(allowed):
         for g in given:
             if g not in allowed:
                 msg = (
-		   'invalid choices: {0} (choices must be a comma separated list of '
-                   'only the following words \n {1}. '  
-		   'No spaces are allowed between choices.)').format(g, repr(allowed).replace(' ', ''))
+                    'invalid choices: {0} (choices must be a comma separated list of '
+                    'only the following words \n {1}. '
+                    'No spaces are allowed between choices.)').format(g, repr(allowed).replace(' ', ''))
                 raise argparse.ArgumentTypeError(msg)
         return given
 
@@ -466,7 +463,7 @@ def ls(args):
     else:
         header = all_ls_headers()
         rows = generate_ls_rows(tenant_reg)
-   
+
     print(cli_table.create(header, rows))
 
 
@@ -478,7 +475,7 @@ def ls_dash_c(columns, tenant_reg):
     headers = []
     choices = commands()['ls']['args']['-c']['choices']
     for i in range(len(choices)):
-        if (choices[i]) in columns:
+        if choices[i] in columns:
             indexes.append(i)
             headers.append(all_headers[i])
     rows = []
@@ -491,7 +488,7 @@ def all_ls_headers():
     """ Return a list of all header for ls -l """
     return ['Volume', 'Datastore', 'Created By VM', 'Created',
             'Attached To VM', 'Policy', 'Capacity', 'Used',
-            'Filesystem Type', 'Access', 'Attach As']
+            'Disk Format', 'Filesystem Type', 'Access', 'Attach As']
 
 def generate_ls_rows(tenant_reg):
     """ Gather all volume metadata into rows that can be used to format a table """
@@ -504,12 +501,13 @@ def generate_ls_rows(tenant_reg):
         policy = get_policy(metadata, path)
         size_info = get_vmdk_size_info(path)
         created, created_by = get_creation_info(metadata)
+        diskformat = get_diskformat(metadata)
         fstype = get_fstype(metadata)
         access = get_access(metadata)
         attach_as = get_attach_as(metadata)
         rows.append([name, v['datastore'], created_by, created, attached_to,
                      policy, size_info['capacity'], size_info['used'],
-                     fstype, access, attach_as])
+                     diskformat, fstype, access, attach_as])
     return rows
 
 
@@ -526,7 +524,10 @@ def get_creation_info(metadata):
 def get_attached_to(metadata):
     """ Return which VM a volume is attached to based on its metadata """
     try:
-        return metadata[kv.ATTACHED_VM_NAME]
+        vm_name = vmdk_ops.vm_uuid2name(metadata[kv.ATTACHED_VM_UUID])
+        if not vm_name:
+            return kv.DETACHED
+        return vm_name
     except:
         return kv.DETACHED
 
@@ -557,6 +558,12 @@ def get_policy(metadata, path):
     else:
         return NOT_AVAILABLE
 
+def get_diskformat(metadata):
+    """ Return the Disk Format of the volume based on its metadata """
+    try:
+        return metadata[kv.VOL_OPTS][kv.DISK_ALLOCATION_FORMAT]
+    except:
+        return NOT_AVAILABLE
 
 def get_fstype(metadata):
     """ Return the Filesystem Type of the volume based on its metadata """
@@ -564,7 +571,6 @@ def get_fstype(metadata):
         return metadata[kv.VOL_OPTS][kv.FILESYSTEM_TYPE]
     except:
         return NOT_AVAILABLE
-
 
 def get_metadata(volPath):
     """ Take the absolute path to volume vmdk and return its metadata as a dict """
@@ -679,7 +685,7 @@ def status(args):
 
 def set_vol_opts(args):
     try:
-        set_ok = vmdk_ops.set_vol_opts(args.volume, args.options) 
+        set_ok = vmdk_ops.set_vol_opts(args.volume, args.options)
         if set_ok:
            print('Successfully updated settings for : {0}'.format(args.volume))
         else:
@@ -723,14 +729,6 @@ def get_listening_port(pid):
     except:
         return NOT_AVAILABLE
 
-_auth_mgr = None
-def connect_auth_db():
-    """ Get a connection to auth DB. """
-    global _auth_mgr
-    if not _auth_mgr:
-        _auth_mgr = auth_data.AuthorizationDataManager()
-        _auth_mgr.connect()
-
 def get_version():
     """ Return the version of the installed VIB """
     try:
@@ -740,44 +738,49 @@ def get_version():
     except:
         return NOT_AVAILABLE
 
-def get_tenant_from_db(name):
+def get_auth_mgr():
     try:
-        connect_auth_db()
-    except auth_data.DbConnectionError, e:
+        auth_mgr = auth.get_auth_mgr()
+    except auth_data.DbConnectionError as e:
         error_info = "Failed to connect auth DB({0})".format(e)
         return error_info, None
-    
-    error_info, tenant = _auth_mgr.get_tenant(name)
+    return None, auth_mgr
+
+def get_tenant_from_db(name):
+    error_info, auth_mgr = get_auth_mgr()
+    if error_info:
+        return error_info, None
+
+    error_info, tenant = auth_mgr.get_tenant(name)
     return error_info, tenant
 
 def create_tenant_in_db(name, description, default_datastore, default_privileges, vms, privileges):
     try:
-        connect_auth_db()
-    except auth_data.DbConnectionError, e:
+        auth_mgr = auth.get_auth_mgr()
+    except auth_data.DbConnectionError as e:
         error_info = "Failed to connect auth DB({0})".format(e)
+
+    if error_info:
         return error_info, None
 
-    error_info, tenant = _auth_mgr.create_tenant(name = name, 
-                                                      description = description, 
-                                                      default_datastore = default_datastore, 
-                                                      default_privileges = default_privileges, 
-                                                      vms = vms, 
-                                                      privileges = privileges)
+    error_info, tenant = auth_mgr.create_tenant(name=name, 
+                                                description=description, 
+                                                default_datastore=default_datastore, 
+                                                default_privileges=default_privileges, 
+                                                vms=vms, 
+                                                privileges=privileges)
     return error_info, tenant
 
 def get_tenant_list_from_db():
-    try: 
-        connect_auth_db()
-        error_info, tenant_list = _auth_mgr.list_tenants()
-    except auth_data.DbConnectionError, e:
-        error_info = "Failed to connect auth DB({0})".format(e)
+    error_info, auth_mgr = get_auth_mgr()
+    if error_info:
         return error_info, None
-
-    error_info, tenant_list = _auth_mgr.list_tenants()
+    
+    error_info, tenant_list = auth_mgr.list_tenants()
     return error_info, tenant_list
 
 def operation_fail(error_info):
-    print error_info
+    print(error_info)
     return error_info
 
 def tenant_ls_headers():
@@ -792,11 +795,11 @@ def generate_vm_list(vms):
         # vm[1] is vm_name, vm has format (vm_uuid, vm_name)
         res = res + vm[1]
         res = res + ","
-        
+
     if res:
         res = res[:-1]
 
-    return res    
+    return res
 
 def generate_tenant_ls_rows(tenant_list):
     """ Generate output for tenant ls command """
@@ -808,7 +811,7 @@ def generate_tenant_ls_rows(tenant_list):
         default_datastore = tenant.default_datastore
         vm_list = generate_vm_list(tenant.vms)
         rows.append([uuid, name, description, default_datastore, vm_list])
-    
+
     return rows
 
 def generate_tuple_from_vm_list(vm_list):
@@ -822,104 +825,66 @@ def generate_tuple_from_vm_list(vm_list):
             error_info =  "Cannot find vm_uuid for vm {0}, tenant_create failed".format(vm_name)
             return error_info, None
         vms.append((vm_uuid, vm_name))
-    
+
     return None, vms
 
 def tenant_create(args):
     """ Handle tenant create command """
-    error_info, vms = generate_tuple_from_vm_list(args.vm_list)
-    if error_info:
-        return operation_fail(error_info)
-      
-    name = args.name 
-    description = "" 
-    default_datastore ="default_ds" 
-    default_privileges =  {}
-    privileges = []
-    
-    error_info, tenant = create_tenant_in_db(
-                                             name = name, 
-                                             description = description, 
-                                             default_datastore = default_datastore, 
-                                             default_privileges = default_privileges, 
-                                             vms = vms, 
-                                             privileges = privileges)
+    error_info, tenant = auth_api._tenant_create(
+                                                 name=args.name , 
+                                                 description="", 
+                                                 default_datastore="default_ds", 
+                                                 default_privileges={}, 
+                                                 vm_list=args.vm_list, 
+                                                 privileges=[])
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant create succeeded"    
- 
+        print("tenant create succeeded")
+
 def tenant_rm(args):
     """ Handle tenant rm command """
-    error_info, tenant = get_tenant_from_db(args.name)
-    if error_info:
-        return operation_fail(error_info)
-
     remove_volumes = False
     # If args "remove_volumes" is not specified in CLI
     # args.remove_volumes will be None
     if args.remove_volumes:
         print("All Volumes will be removed")
         remove_volumes = True
+    
+    error_info = auth_api._tenant_rm(args.name, remove_volumes)
 
-    error_info = _auth_mgr.remove_tenant(tenant.id, remove_volumes)
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant rm succeeded"
+        print("tenant rm succeeded")
 
 def tenant_ls(args):
     """ Handle tenant ls command """
-    error_info, tenant_list = get_tenant_list_from_db()
+    error_info, tenant_list = auth_api._tenant_ls()
     if error_info:
         return operation_fail(error_info)
 
     header = tenant_ls_headers()
     rows = generate_tenant_ls_rows(tenant_list)
-    print(cli_table.create(header, rows)) 
+    print(cli_table.create(header, rows))
 
 def tenant_vm_add(args):
     """ Handle tenant vm add command """
-    error_info, tenant = get_tenant_from_db(args.name)
-    if error_info:
-        return operation_fail(error_info)
-    
-    if not tenant:
-        error_info = "Tenant {0} does not exist".format(args.name)
-        return operation_fail(error_info)
-
-    error_info, vms = generate_tuple_from_vm_list(args.vm_list)
-    if error_info:
-        return operation_fail(error_info)
- 
-    error_info = tenant.add_vms(_auth_mgr.conn, vms)
+    error_info = auth_api._tenant_vm_add(args.name, args.vm_list)
 
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant vm add succeeded"
-  
+        print("tenant vm add succeeded")
+
 def tenant_vm_rm(args):
     """ Handle tenant vm rm command """
-    error_info, tenant = get_tenant_from_db(args.name)
-    if error_info:
-        return operation_fail(error_info)
-    
-    if not tenant:
-        error_info = "Tenant {0} does not exist".format(args.name)
-        return operation_fail(error_info)
-
-    error_info, vms = generate_tuple_from_vm_list(args.vm_list)
-    
-    if error_info:
-        return operation_fail(error_info)
-      
-    error_info = tenant.remove_vms(_auth_mgr.conn, vms)
+    error_info = auth_api._tenant_vm_rm(args.name, args.vm_list)
 
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant vm rm succeeded"
+        print("tenant vm rm succeeded")
 
 def tenant_vm_ls_headers():
     """ Return column names for tenant vm ls command """
@@ -934,22 +899,17 @@ def generate_tenant_vm_ls_rows(vms):
         uuid = vm[0]
         name = vm[1]
         rows.append([uuid, name])
-    
-    return rows
 
+    return rows
 
 def tenant_vm_ls(args):
     """ Handle tenant vm ls command """
-    error_info, tenant = get_tenant_from_db(args.name)
+    error_info, vms = auth_api._tenant_vm_ls(args.name)
     if error_info:
-        return operation_fail(error_info)
-    
-    if not tenant:
-        error_info = "Tenant {0} does not exist".format(args.name)
-        return operation_fail(error_info)
-   
+        return error_info
+
     header = tenant_vm_ls_headers()
-    rows = generate_tenant_vm_ls_rows(tenant.vms)
+    rows = generate_tenant_vm_ls_rows(vms)
     print(cli_table.create(header, rows))
 
 def default_privileges():
@@ -982,55 +942,50 @@ def generate_privileges(args):
     """ Generate privileges based on CLI argument """
     privileges = default_privileges()[0]
     privileges[auth_data_const.COL_DATASTORE] = args.datastore
-    
+
     if args.rights:
         set_privileges(args.rights, privileges, 1)
-    
+
     if args.volume_maxsize:
         size_in_MB = convert.convert_to_MB(args.volume_maxsize)
         privileges[auth_data_const.COL_MAX_VOLUME_SIZE] = size_in_MB
-    
+
     if args.volume_totalsize:
         size_in_MB = convert.convert_to_MB(args.volume_totalsize)
         privileges[auth_data_const.COL_USAGE_QUOTA] = size_in_MB
-    
+
     return privileges
 
 def tenant_access_add(args):
     """ Handle tenant access command """
-    error_info, tenant = get_tenant_from_db(args.name)
-    if error_info:
-        return operation_fail(error_info)
-
-    if not tenant:
-        error_info = "Tenant {0} does not exist".format(args.name)
-        return operation_fail(error_info)
-
-    privileges = generate_privileges(args)
-    print privileges
-    error_info = tenant.set_datastore_access_privileges(_auth_mgr.conn, [privileges])
+    error_info = auth_api._tenant_access_add(name=args.name,
+                                             datastore=args.datastore,
+                                             rights=args.rights,
+                                             volume_maxsize=args.volume_maxsize,
+                                             volume_totalsize=args.volume_totalsize
+                                             )
       
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant access add succeeded"
+        print("tenant access add succeeded")
 
 def modify_privileges(privileges, args):
     """ Modify privileges based on CLI argument """
     if args.add_rights:
         set_privileges(args.add_rights, privileges, 1)
-        
+
     if args.rm_rights:
         set_privileges(args.rm_rights, privileges, 0)
 
     if args.volume_maxsize:
         size_in_MB = convert.convert_to_MB(args.volume_maxsize)
         privileges[auth_data_const.COL_MAX_VOLUME_SIZE] = size_in_MB
-    
+
     if args.volume_totalsize:
         size_in_MB = convert.convert_to_MB(args.volume_totalsize)
         privileges[auth_data_const.COL_USAGE_QUOTA] = size_in_MB
-    
+
     return privileges
 
 def generate_privileges_dict(privileges):
@@ -1050,42 +1005,26 @@ def generate_privileges_dict(privileges):
 
 def tenant_access_set(args):
     """ Handle tenant access set command """
-    error_info, tenant = get_tenant_from_db(args.name)
-    if error_info:
-        return operation_fail(error_info)
-
-    if not tenant:
-        error_info = "Tenant {0} does not exist".format(args.name)
-        return operation_fail(error_info)
-
-    privileges = [d for d in tenant.privileges if d[auth_data_const.COL_DATASTORE] == args.datastore]
-    
-    if not privileges:
-        error_info = "No privileges exist for ({0}, {1})".format(args.name, args.datastore)
-        return operation_fail(error_info)
-    
-    privileges_dict = generate_privileges_dict(privileges[0])
-    privileges_dict = modify_privileges(privileges_dict, args)
-    
-    error_info = tenant.set_datastore_access_privileges(_auth_mgr.conn, [privileges_dict])
+    error_info = auth_api._tenant_access_set(name=args.name, 
+                                             datastore=args.datastore, 
+                                             add_rights=args.add_rights, 
+                                             rm_rights=args.rm_rights, 
+                                             volume_maxsize=args.volume_maxsize, 
+                                             volume_totalsize=args.volume_totalsize)
 
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant access set succeeded"
-       
+        print("tenant access set succeeded")
+
 def tenant_access_rm(args):
     """ Handle tenant access rm command """
-    error_info, tenant = get_tenant_from_db(args.name)
-    if error_info:
-        return operation_fail(error_info)
-
-    error_info = tenant.remove_datastore_access_privileges(_auth_mgr.conn, args.datastore)
+    error_info = auth_api._tenant_access_rm(args.name, args.datastore)
     if error_info:
         return operation_fail(error_info)
     else:
-        print "tenant access rm succeeded"
-    
+        print("tenant access rm succeeded")
+
 def tenant_access_ls_headers():
     """ Return column names for tenant access ls command """
     headers = ['Datastore', 'Create_volume', 'Delete_volume', 'Mount_volume', 'Max_volume_size', 'Total_size']
@@ -1104,17 +1043,16 @@ def generate_tenant_access_ls_rows(privileges):
         # p[auth_data_const.COL_USAGE_QUOTA] is total_size in MB
         total_size = "Unset" if p[auth_data_const.COL_USAGE_QUOTA] == 0 else human_readable(p[auth_data_const.COL_USAGE_QUOTA]*MB)
         rows.append([datastore, create_volume, delete_volume, mount_volume, max_vol_size, total_size])
-        
+
     return rows
 
 def tenant_access_ls(args):
     """ Handle tenant access ls command """
-    error_info, tenant = get_tenant_from_db(args.name)
+    name = args.name
+    error_info, privileges = auth_api._tenant_access_ls(name)
     if error_info:
         return operation_fail(error_info)
 
-    privileges = tenant.privileges 
-    
     header = tenant_access_ls_headers()
     rows = generate_tenant_access_ls_rows(privileges)
     print(cli_table.create(header, rows))

@@ -86,6 +86,7 @@ import vmdk_perf as perf
 import auth
 import sqlite3
 import convert
+import error_code
 
 # Python version 3.5.1
 PYTHON64_VERSION = 50659824
@@ -148,6 +149,7 @@ def RunCommand(cmd):
     p = subprocess.Popen(cmd,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE,
+                         universal_newlines=True,
                          shell=True)
     o, e = p.communicate()
     s = p.returncode
@@ -161,7 +163,7 @@ def RunCommand(cmd):
 # returns error, or None for OK
 # opts is  dictionary of {option: value}.
 # for now we care about size and (maybe) policy
-def createVMDK(vmdk_path, vm_name, vol_name, opts={}):
+def createVMDK(vmdk_path, vm_name, vol_name, opts={}, vm_uuid=None, tenant_uuid=None, datastore=None):
     logging.info("*** createVMDK: %s opts = %s", vmdk_path, opts)
     if os.path.isfile(vmdk_path):
         return err("File %s already exists" % vmdk_path)
@@ -171,6 +173,10 @@ def createVMDK(vmdk_path, vm_name, vol_name, opts={}):
     except ValidationError as e:
         return err(e.msg)
 
+    if kv.CLONE_FROM in opts:
+        return cloneVMDK(vm_name, vmdk_path, opts,
+                         vm_uuid, datastore)
+
     cmd = make_create_cmd(opts, vmdk_path)
     rc, out = RunCommand(cmd)
     if rc != 0:
@@ -179,12 +185,25 @@ def createVMDK(vmdk_path, vm_name, vol_name, opts={}):
     if not create_kv_store(vm_name, vmdk_path, opts):
         msg = "Failed to create metadata kv store for {0}".format(vmdk_path)
         logging.warning(msg)
-        removeVMDK(vmdk_path)
-        return err(msg)
-
+        error_info = err(msg)
+        remove_err = removeVMDK(vmdk_path=vmdk_path, 
+                                vol_name=vol_name, 
+                                vm_name=vm_name,
+                                tenant_uuid=tenant_uuid,
+                                datastore=datastore)
+        if remove_err:
+            error_info = error_info + remove_err
+        return error_info
+   
     backing, needs_cleanup = get_backing_device(vmdk_path)
     cleanup_backing_device(backing, needs_cleanup)
 
+    # create succeed, insert the volume information into "volumes" table
+    if tenant_uuid:
+        vol_size_in_MB = convert.convert_to_MB(auth.get_vol_size(opts))
+        auth.add_volume_to_volumes_table(tenant_uuid, datastore, vol_name, vol_size_in_MB)
+    else:
+        logging.debug(error_code.VM_NOT_BELONG_TO_TENANT.format(vm_name))
 
 def make_create_cmd(opts, vmdk_path):
     """ Return the command used to create a VMDK """
@@ -211,6 +230,102 @@ def make_create_cmd(opts, vmdk_path):
         return "{0} -d {1} -c {2} {3}".format(VMDK_CREATE_CMD, disk_format, size, vmdk_path)
 
 
+def cloneVMDK(vm_name, vmdk_path, opts={}, vm_uuid=None, vm_datastore=None):
+    logging.info("*** cloneVMDK: %s opts = %s", vmdk_path, opts)
+
+    # Get source volume path for cloning
+    error_info, tenant_uuid, tenant_name = auth.get_tenant(vm_uuid)
+    if error_info:
+        return err(error_info)
+
+    try:
+        src_volume, src_datastore = parse_vol_name(opts[kv.CLONE_FROM])
+    except ValidationError as ex:
+        return err(str(ex))
+    if not src_datastore:
+        src_datastore = vm_datastore
+    elif not vmdk_utils.validate_datastore(src_datastore):
+        return err("Invalid datastore '%s'.\n" \
+                    "Known datastores: %s.\n" \
+                    "Default datastore: %s" \
+                    % (src_datastore, ", ".join(get_datastore_names_list), vm_datastore))
+
+    error_info, tenant_uuid, tenant_name = auth.authorize(vm_uuid,
+                                                          src_datastore, auth.CMD_ATTACH, {})
+    if error_info:
+        errmsg = "Failed to authorize VM: {0}, datastore: {1}".format(error_info, src_datastore)
+        logging.warning("*** cloneVMDK: %s", errmsg)
+        return err(errmsg)
+
+    src_path, errMsg = get_vol_path(src_datastore, tenant_name)
+    if src_path is None:
+        return err("Failed to initialize source volume path {0}: {1}".format(src_path, errMsg))
+
+    src_vmdk_path = vmdk_utils.get_vmdk_path(src_path, src_volume)
+    if not os.path.isfile(src_vmdk_path):
+        return err("Could not find volume for cloning %s" % opts[kv.CLONE_FROM])
+
+    with lockManager.get_lock(src_volume):
+        # Verify if the source volume is in use.
+        attached, uuid, attach_as = getStatusAttached(src_vmdk_path)
+        if attached:
+            if handle_stale_attach(vmdk_path, uuid):
+                return err("Source volume cannot be in use when cloning")
+
+        # Reauthorize with size info of the volume being cloned
+        src_vol_info = kv.get_vol_info(src_vmdk_path)
+        datastore = vmdk_utils.get_datastore_from_vmdk_path(vmdk_path)
+        opts["size"] = src_vol_info["size"]
+        error_info, tenant_uuid, tenant_name = auth.authorize(vm_uuid,
+                                                              datastore, auth.CMD_CREATE, opts)
+        if error_info:
+            return err(error_info)
+
+        # Handle the allocation format
+        if not kv.DISK_ALLOCATION_FORMAT in opts:
+            disk_format = kv.DEFAULT_ALLOCATION_FORMAT
+        else:
+            disk_format = str(opts[kv.DISK_ALLOCATION_FORMAT])
+
+        # VirtualDiskSpec
+        vdisk_spec = vim.VirtualDiskManager.VirtualDiskSpec()
+        vdisk_spec.adapterType = 'busLogic'
+        vdisk_spec.diskType = disk_format
+
+        # Form datastore path from vmdk_path
+        dest_vol = vmdk_utils.get_datastore_path(vmdk_path)
+        source_vol = vmdk_utils.get_datastore_path(src_vmdk_path)
+
+        si = get_si()
+        task = si.content.virtualDiskManager.CopyVirtualDisk(
+            sourceName=source_vol, destName=dest_vol, destSpec=vdisk_spec)
+        try:
+            wait_for_tasks(si, [task])
+        except vim.fault.VimFault as ex:
+            return err("Failed to clone volume: {0}".format(ex.msg))
+
+    # Update volume meta
+    vol_name = vmdk_utils.strip_vmdk_extension(src_vmdk_path.split("/")[-1])
+    vol_meta = kv.getAll(vmdk_path)
+    vol_meta[kv.CREATED_BY] = vm_name
+    vol_meta[kv.CREATED] = time.asctime(time.gmtime())
+    vol_meta[kv.VOL_OPTS][kv.CLONE_FROM] = src_volume
+    vol_meta[kv.VOL_OPTS][kv.DISK_ALLOCATION_FORMAT] = disk_format
+    if kv.ACCESS in opts:
+        vol_meta[kv.VOL_OPTS][kv.ACCESS] = opts[kv.ACCESS]
+    if kv.ATTACH_AS in opts:
+        vol_meta[kv.VOL_OPTS][kv.ATTACH_AS] = opts[kv.ATTACH_AS]
+
+    if not kv.setAll(vmdk_path, vol_meta):
+        msg = "Failed to create metadata kv store for {0}".format(vmdk_path)
+        logging.warning(msg)
+        removeVMDK(vmdk_path)
+        return err(msg)
+
+    backing, needs_cleanup = get_backing_device(vmdk_path)
+    cleanup_backing_device(backing, needs_cleanup)
+
+
 def create_kv_store(vm_name, vmdk_path, opts):
     """ Create the metadata kv store for a volume """
     vol_meta = {kv.STATUS: kv.DETACHED,
@@ -228,10 +343,10 @@ def validate_opts(opts, vmdk_path):
      * diskformat - The allocation format of allocated disk
     """
     valid_opts = [kv.SIZE, kv.VSAN_POLICY_NAME, kv.DISK_ALLOCATION_FORMAT,
-                kv.ATTACH_AS, kv.ACCESS, kv.FILESYSTEM_TYPE]
+                  kv.ATTACH_AS, kv.ACCESS, kv.FILESYSTEM_TYPE, kv.CLONE_FROM]
     defaults = [kv.DEFAULT_DISK_SIZE, kv.DEFAULT_VSAN_POLICY,\
                 kv.DEFAULT_ALLOCATION_FORMAT, kv.DEFAULT_ATTACH_AS,\
-                kv.DEFAULT_ACCESS, kv.DEFAULT_FILESYSTEM_TYPE]
+                kv.DEFAULT_ACCESS, kv.DEFAULT_FILESYSTEM_TYPE, kv.DEFAULT_CLONE_FROM]
     invalid = frozenset(opts.keys()).difference(valid_opts)
     if len(invalid) != 0:
         msg = 'Invalid options: {0} \n'.format(list(invalid)) \
@@ -239,8 +354,11 @@ def validate_opts(opts, vmdk_path):
                + '{0}'.format(zip(list(valid_opts), defaults))
         raise ValidationError(msg)
 
+    # For validation of clone (in)compatible options
+    clone = True if kv.CLONE_FROM in opts else False
+
     if kv.SIZE in opts:
-        validate_size(opts[kv.SIZE])
+        validate_size(opts[kv.SIZE], clone)
     if kv.VSAN_POLICY_NAME in opts:
         validate_vsan_policy_name(opts[kv.VSAN_POLICY_NAME], vmdk_path)
     if kv.DISK_ALLOCATION_FORMAT in opts:
@@ -249,13 +367,18 @@ def validate_opts(opts, vmdk_path):
         validate_attach_as(opts[kv.ATTACH_AS])
     if kv.ACCESS in opts:
         validate_access(opts[kv.ACCESS])
+    if kv.FILESYSTEM_TYPE in opts:
+        validate_fstype(opts[kv.FILESYSTEM_TYPE], clone)
 
 
-def validate_size(size):
+def validate_size(size, clone=False):
     """
     Ensure size is given in a human readable format <int><unit> where int is an
     integer and unit is either 'mb', 'gb', or 'tb'. e.g. 22mb
     """
+    if clone:
+        raise ValidationError("Cannot define the size for a clone")
+
     if not size.lower().endswith(('kb', 'mb', 'gb', 'tb'
                                   )) or not size[:-2].isdigit():
         msg = ('Invalid format for size. \n'
@@ -280,7 +403,8 @@ def validate_disk_allocation_format(alloc_format):
     """
     if not alloc_format in kv.VALID_ALLOCATION_FORMATS :
         raise ValidationError("Disk Allocation Format \'{0}\' is not supported."
-                              " Valid options are: {1}".format(alloc_format, kv.VALID_ALLOCATION_FORMATS))
+                            " Valid options are: {1}.".format(
+                            alloc_format, kv.VALID_ALLOCATION_FORMATS))
 
 def validate_attach_as(attach_type):
     """
@@ -298,6 +422,13 @@ def validate_access(access_type):
        raise ValidationError("Access type '{0}' is not supported."
                              " Valid options are: {1}".format(access_type,
                                                               kv.ACCESS_TYPES))
+
+def validate_fstype(fstype, clone=False):
+    """
+    Ensure that we don't accept fstype for a clone
+    """
+    if clone:
+        raise ValidationError("Cannot define the filesystem type for a clone")
 
 # Returns the UUID if the vmdk_path is for a VSAN backed.
 def get_vsan_uuid(vmdk_path):
@@ -399,12 +530,16 @@ def vol_info(vol_meta, vol_size_info, bus_number, unit, datastore):
           vinfo[kv.ACCESS] = vol_meta[kv.VOL_OPTS][kv.ACCESS]
        else:
           vinfo[kv.ACCESS] = kv.DEFAULT_ACCESS
+       if kv.CLONE_FROM in vol_meta[kv.VOL_OPTS]:
+          vinfo[kv.CLONE_FROM] = vol_meta[kv.VOL_OPTS][kv.CLONE_FROM]
+       else:
+          vinfo[kv.CLONE_FROM] = kv.DEFAULT_CLONE_FROM
 
     return vinfo
 
 
 # Return error, or None for OK
-def removeVMDK(vmdk_path):
+def removeVMDK(vmdk_path, vol_name=None, vm_name=None, tenant_uuid=None, datastore=None):
     logging.info("*** removeVMDK: %s", vmdk_path)
 
     # Check the current volume status
@@ -431,8 +566,15 @@ def removeVMDK(vmdk_path):
         elif rc != 0:
             return err("Failed to remove %s. %s" % (vmdk_path, out))
         else:
-            return None
+            # remove succeed, remove infomation of this volume from volumes table
+            if tenant_uuid:
+                error_info = auth.remove_volume_from_volumes_table(tenant_uuid, datastore, vol_name)
+                return error_info
+            else:
+                if not vm_name:
+                    logging.debug(error_code.VM_NOT_BELONG_TO_TENANT.format(vm_name))
 
+            return None
 
 def getVMDK(vmdk_path, vol_name, vm_uuid, datastore):
     """Checks if the volume exists, and returns error if it does not"""
@@ -480,6 +622,11 @@ def findVmByUuid(vm_uuid):
     vm = si.content.searchIndex.FindByUuid(None, vm_uuid, True, False)
     return vm
 
+def vm_uuid2name(vm_uuid):
+    vm = findVmByUuid(vm_uuid)
+    if not vm or not vm.config:
+        return None
+    return vm.config.name
 
 # Return error, or None for OK.
 def attachVMDK(vmdk_path, vm_uuid):
@@ -501,7 +648,7 @@ def detachVMDK(vmdk_path, vm_uuid):
 def get_vol_path(datastore, tenant_name=None):
     # If the command is NOT running under a tenant, the folder for Docker
     # volumes is created on <datastore>/DOCK_VOLS_DIR
-    # If the command is running under a tenant, the foler for Dock volume
+    # If the command is running under a tenant, the folder for Dock volume
     # is created on <datastore>/DOCK_VOLS_DIR/tenant_name
     dock_vol_path = os.path.join("/vmfs/volumes", datastore, DOCK_VOLS_DIR)
     if tenant_name:
@@ -599,6 +746,7 @@ def executeRequest(vm_uuid, vm_name, config_path, cmd, full_vol_name, opts):
 
     Returns None (if all OK) or error string
     """
+    logging.debug("config_path=%s", config_path)
     vm_datastore = get_datastore_name(config_path)
     error_info, tenant_uuid, tenant_name = auth.get_tenant(vm_uuid)
     if error_info:
@@ -633,18 +781,19 @@ def executeRequest(vm_uuid, vm_name, config_path, cmd, full_vol_name, opts):
 
     if cmd == "get":
         response = getVMDK(vmdk_path, vol_name, vm_uuid, datastore)
-    elif cmd == "create":
-        response = createVMDK(vmdk_path, vm_name, vol_name, opts)
-        # create succeed, insert infomation of this volume to volumes table
-        if not response:
-            if tenant_uuid:
-                vol_size_in_MB = convert.convert_to_MB(auth.get_vol_size(opts))
-                auth.add_volume_to_volumes_table(tenant_uuid, datastore, vol_name, vol_size_in_MB)
-            else:
-                logging.warning(" VM %s does not belong to any tenant", vm_name)
-
+    elif cmd == "create":              
+        response = createVMDK(vmdk_path=vmdk_path, 
+                              vm_name=vm_name, 
+                              vol_name=vol_name, 
+                              opts=opts, 
+                              tenant_uuid=tenant_uuid, 
+                              datastore=datastore)
     elif cmd == "remove":
-        response = removeVMDK(vmdk_path)
+        response = removeVMDK(vmdk_path=vmdk_path, 
+                              vol_name=vol_name,
+                              vm_name=vm_name,
+                              tenant_uuid=tenant_uuid,
+                              datastore=datastore)
     elif cmd == "attach":
         response = attachVMDK(vmdk_path, vm_uuid)
     elif cmd == "detach":

@@ -40,6 +40,9 @@ SPECIAL_FILES_REGEXP = r"\A.*-(delta|ctk|digest|flat)\.vmdk$"
 # glob expression to match end of 'delta' (aka snapshots) file names.
 SNAP_SUFFIX_GLOB = "-[0-9][0-9][0-9][0-9][0-9][0-9].vmdk"
 
+# regexp for finding datastore path "[datastore] path/to/file.vmdk" from full vmdk path
+DATASTORE_PATH_REGEXP = r"^/vmfs/volumes/([^/]+)/(.*\.vmdk)$"
+
 def init_datastoreCache():
     """
     Initializes the datastore cache with the list of datastores accessible from local ESX host.
@@ -151,6 +154,21 @@ def get_vmdk_path(path, vol_name):
     return latest
 
 
+def get_datastore_path(vmdk_path):
+    """Returns a string datastore path "[datastore] path/to/file.vmdk"
+    from a full vmdk path.
+    """
+    match = re.search(DATASTORE_PATH_REGEXP, vmdk_path)
+    datastore, path = match.groups()
+    return "[{0}] {1}".format(datastore, path)
+
+def get_datastore_from_vmdk_path(vmdk_path):
+    """Returns a string representing the datastore from a full vmdk path.
+    """
+    match = re.search(DATASTORE_PATH_REGEXP, vmdk_path)
+    datastore, path = match.groups()
+    return datastore
+
 def list_vmdks(path, volname="", show_snapshots=False):
     """ Return a list of VMDKs in a given path. Filters out non-descriptor
     files and delta disks.
@@ -207,11 +225,39 @@ def strip_vmdk_extension(filename):
     return filename.replace(".vmdk", "")
 
 def get_vm_uuid_by_name(vm_name):
-    """Returns vm_uuid for given vm_name, or None"""
+    """ Returns vm_uuid for given vm_name, or None """
     si = vmdk_ops.get_si()
     try:
         vm = [d for d in si.content.rootFolder.childEntity[0].vmFolder.childEntity if d.config.name == vm_name]
         return vm[0].config.uuid
+    except:
+        return None
+
+def get_vm_config_path(vm_name):
+    """Returns vm_uuid for given vm_name, or None """
+    si = vmdk_ops.get_si()
+    try:
+        vm = [d for d in si.content.rootFolder.childEntity[0].vmFolder.childEntity if d.config.name == vm_name]
+        config_path = vm[0].summary.config.vmPathName   
+    except:
+        return None
+    
+     # config path has the format like this "[datastore1] test_vm1/test_vm1/test_vm1.vmx"
+    datastore, path = config_path.split()
+    datastore = datastore[1:-1]
+    datastore_path = os.path.join("/vmfs/volumes/", datastore)
+    # datastore_path has the format like this /vmfs/volumes/datastore_name
+    vm_config_path = os.path.join(datastore_path, path)
+    return vm_config_path
+
+def find_vm_by_name(vm_name):
+    """ Return vm for given vm_name, or None """
+    si = vmdk_ops.get_si()
+    try:
+        vm = [d for d in si.content.rootFolder.childEntity[0].vmFolder.childEntity 
+                if d.config.name == vm_name]
+        return vm[0]
+
     except:
         return None
 

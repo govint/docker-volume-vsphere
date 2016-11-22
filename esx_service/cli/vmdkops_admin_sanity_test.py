@@ -20,6 +20,9 @@ import os
 
 ADMIN_CLI = '/usr/lib/vmware/vmdkops/bin/vmdkops_admin.py'
 
+# Number of expected columns in ADMIN_CLI ls
+EXPECTED_COLUMN_COUNT = 12
+
 class TestVmdkopsAdminSanity(unittest.TestCase):
     """ Test output from running vmdkops_admin.py """
 
@@ -38,8 +41,7 @@ class TestVmdkopsAdminSanity(unittest.TestCase):
         output = output.decode('utf-8')
         lines = output.split('\n')
         divider_columns = lines[1].split()
-        expected_column_count = 11
-        self.assertEqual(expected_column_count, len(divider_columns))
+        self.assertEqual(EXPECTED_COLUMN_COUNT, len(divider_columns))
         for string in divider_columns:
             self.assertTrue(all_dashes(string))
 
@@ -65,7 +67,7 @@ class TestVmdkopsAdminSanity(unittest.TestCase):
         self.assertEqual(len(lines), 7)
         expected_headers = ['Version', 'Status', 'Pid', 'Port', 'LogConfigFile',
                            'LogFile', 'LogLevel']
-        headers = map(lambda s: s.split(': ')[0], lines)
+        headers = list(map(lambda s: s.split(': ')[0], lines))
         self.assertEqual(expected_headers, headers)
 
 
