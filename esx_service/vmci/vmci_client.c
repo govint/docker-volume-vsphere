@@ -172,17 +172,12 @@ vsock_init(be_sock_id *id, int cid, int port)
    int ret;
    int af;    // family id
    int sock;  // socket id
-   int opt_val = 1;
 
    if ((af = vsock_get_family()) == -1) {
       return CONN_FAILURE;
    }
    sock = socket(af, SOCK_STREAM, 0);
    if (sock == -1) {
-      return CONN_FAILURE;
-   }
-   ret = setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt_val, sizeof(opt_val));
-   if (ret == -1) {
       return CONN_FAILURE;
    }
 
