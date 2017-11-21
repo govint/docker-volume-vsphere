@@ -1787,7 +1787,7 @@ def execRequestThread(client_socket, cartel, request):
         vm_uuid = UUID_FORMAT.format(*uuid.replace("-",  " ").split())
         vc_uuid = None
         if len(vcuuid) > 0:
-            vc_uuid = UUID_FORMAT.format(*vc_uuid.replace("-",  " ").split())
+            vc_uuid = UUID_FORMAT.format(*vcuuid.replace("-",  " ").split())
 
         try:
             req = json.loads(request.decode('utf-8'))
