@@ -1786,6 +1786,8 @@ def execRequestThread(client_socket, cartel, request):
         UUID_FORMAT = "{0}{1}{2}{3}-{4}{5}-{6}{7}-{8}{9}-{10}{11}{12}{13}{14}{15}"
         vm_uuid = UUID_FORMAT.format(*uuid.replace("-",  " ").split())
         vc_uuid = None
+
+        # Use a VC uuid if one is present
         if len(vcuuid) > 0:
             vc_uuid = UUID_FORMAT.format(*vcuuid.replace("-",  " ").split())
 
