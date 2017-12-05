@@ -17,6 +17,7 @@ package plugin_utils
 // This file holds utility/helper methods required in plugin module
 
 import (
+	"runtime"
 	"strings"
 
 	log "github.com/Sirupsen/logrus"
@@ -70,7 +71,11 @@ func IsFullVolName(volName string) bool {
 func GetVolumeInfo(name string, datastoreName string, d drivers.VolumeDriver) (*VolumeInfo, error) {
 	// if fullname already, return
 	if IsFullVolName(name) {
-		return &VolumeInfo{name, "", nil}, nil
+		if runtime.GOOS == "windows" {
+			name = strings.Split(name, "@")[0]
+		} else {
+			return &VolumeInfo{name, "", nil}, nil
+		}
 	}
 
 	// if datastore name is provided, append and return
