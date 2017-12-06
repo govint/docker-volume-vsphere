@@ -69,7 +69,8 @@ func IsFullVolName(volName string) bool {
 // Optionally returns datastore and volume metadata if retrieved from ESX.
 // If Volume Metadata is nil then caller can use getVolume()
 func GetVolumeInfo(name string, datastoreName string, d drivers.VolumeDriver) (*VolumeInfo, error) {
-	// if fullname already, return
+	// If fullname already, return for Linux, convert to short name for Windows
+	// so, the correct datastore name is used here.
 	if IsFullVolName(name) {
 		if runtime.GOOS == "windows" {
 			name = strings.Split(name, "@")[0]
