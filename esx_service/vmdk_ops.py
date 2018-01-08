@@ -1268,7 +1268,7 @@ def get_controller_pci_slot(vm, pvscsi, key_offset):
        key = 'scsi{0}.pciSlotNumber'.format(pvscsi.key -
                                             key_offset)
        slot = [cfg for cfg in vm.config.extraConfig \
-               if cfg.key == key]
+               if cfg.key.lower() == key.lower()]
        # If the given controller exists
        if slot:
           slot_num = slot[0].value
@@ -1285,7 +1285,7 @@ def get_controller_pci_slot(vm, pvscsi, key_offset):
         # Get PCI bridge slot number
         key = 'pciBridge{0}.pciSlotNumber'.format(bus)
         bridge_slot = [cfg for cfg in vm.config.extraConfig \
-                       if cfg.key == key]
+                       if cfg.key.lower() == key.lower()]
         if bridge_slot:
             slot_num = bridge_slot[0].value
         else:
