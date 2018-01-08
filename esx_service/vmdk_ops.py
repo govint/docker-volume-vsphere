@@ -1264,7 +1264,7 @@ def get_controller_pci_slot(vm, pvscsi, key_offset):
     if pvscsi.slotInfo:
        slot_num = pvscsi.slotInfo.pciSlotNumber
     else:
-       # Slot number is got from from the VM config
+       # Slot number is got from from the VM config.
        key = 'scsi{0}.pciSlotNumber'.format(pvscsi.key -
                                             key_offset)
        slot = [cfg for cfg in vm.config.extraConfig \
