@@ -377,21 +377,18 @@ def fixup_kv(src_volpath, dst_volpath):
         # If the destination is a virtual type volume,
         # the source will create a native sidecar that must be deleted
         # and a new flat file version is created.
-        if dst_vol_type.value == c_uint32(KV_VOL_VIRTUAL).value:
-            dhandle = vol_open_path(dst_volpath)
-            if not disk_is_valid(dhandle):
-                return False
-            res = lib.DiskLib_SidecarDelete(dhandle, DVOL_KEY.encode())
-            if res != 0:
-                logging.warning("Side car delete for %s failed - %x", dst_volpath, res)
-                lib.DiskLib_Close(dhandle)
-                return False
-
+        dhandle = vol_open_path(dst_volpath)
+        if not disk_is_valid(dhandle):
+            return False
+        res = lib.DiskLib_SidecarDelete(dhandle, DVOL_KEY.encode())
+        if res != 0:
+            logging.warning("Side car delete for %s failed - %x", dst_volpath, res)
             lib.DiskLib_Close(dhandle)
-            src_dict = load(src_volpath)
-            return create(dst_volpath, src_dict)
-        else:
-            return True
+            return False
+
+        lib.DiskLib_Close(dhandle)
+        src_dict = load(src_volpath)
+        return create(dst_volpath, src_dict)
     else:
         # The source is a virtual type volume, the destination
         # doesn't yet have a KV file, create it now. This is true
