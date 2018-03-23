@@ -237,7 +237,7 @@ def create(volpath, kv_dict):
     # If the volume is a virtual type then the KV as a flat file.
     vol_type = get_vol_type(volpath)
     if not vol_type:
-        logging.warning("Could not determine type of volume %s, error - %x", volpath, res)
+        logging.warning("Could not determine type of volume %s", volpath)
         return False
     if vol_type == c_uint32(KV_VOL_VIRTUAL).value:
         return save(volpath, kv_dict)
@@ -271,7 +271,7 @@ def delete(volpath):
     """
     vol_type = get_vol_type(volpath)
     if not vol_type:
-        logging.warning("KV delete - could not determine type of volume %s, error - %x", volpath, res)
+        logging.warning("KV delete - could not determine type of volume %s", volpath)
         return False
     if vol_type == c_uint32(KV_VOL_VIRTUAL).value:
         meta_file = lib.DiskLib_SidecarMakeFileName(volpath.encode(), DVOL_KEY.encode())
@@ -310,7 +310,7 @@ def load(volpath):
     """
     vol_type = get_vol_type(volpath)
     if not vol_type:
-        logging.warning("KV delete - could not determine type of volume %s, error - %x", volpath, res)
+        logging.warning("KV delete - could not determine type of volume %s", volpath)
         return False
     if vol_type == c_uint32(KV_VOL_VIRTUAL).value:
         meta_file = lib.DiskLib_SidecarMakeFileName(volpath.encode(),
@@ -351,7 +351,7 @@ def save(volpath, kv_dict, key=None, value=None):
     """
     vol_type = get_vol_type(volpath)
     if not vol_type:
-        logging.warning("KV delete - could not determine type of volume %s, error - %x", volpath, res)
+        logging.warning("KV delete - could not determine type of volume %s", volpath)
         return False
     if vol_type == c_uint32(KV_VOL_VIRTUAL).value:
         meta_file = lib.DiskLib_SidecarMakeFileName(volpath.encode(),
@@ -403,13 +403,13 @@ def fixup_kv(src_volpath, dst_volpath):
     src_vol_type = get_vol_type(src_volpath)
     logging.warning("Source vvol type %x", src_vol_type)
     if not src_vol_type:
-        logging.warning("KV delete - could not determine type of volume %s, error - %x", volpath, res)
+        logging.warning("KV delete - could not determine type of volume %s", src_volpath)
         return False
 
     dst_vol_type = get_vol_type(dst_volpath)
     logging.warning("Dest vvol type %x", src_vol_type)
     if not dst_vol_type:
-        logging.warning("KV delete - could not determine type of volume %s, error - %x", volpath, res)
+        logging.warning("KV delete - could not determine type of volume %s", dst_volpath)
         return False
 
     if src_vol_type != c_uint32(KV_VOL_VIRTUAL).value:
