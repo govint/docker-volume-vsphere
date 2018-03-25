@@ -199,13 +199,17 @@ def get_vol_type(volpath):
 
 def get_kv_filename(volpath):
     kv_type = KV_FILE_TYPE
-    with open(volpath) as f:
-        for line in f:
-            if KV_FILE_TYPE in line:
-                s=line.split(',')[1]
-                kv_file = s.split('"')[0]
-                return "{0}/{1}".format(os.path.dirname(volpath),
-                       kv_file)
+    try:
+        with open(volpath) as f:
+            for line in f:
+                if KV_FILE_TYPE in line:
+                    s=line.split(',')[1]
+                    kv_file = s.split('"')[0]
+                    return "{0}/{1}".format(os.path.dirname(volpath),
+                           kv_file)
+    except IOError as open_error:
+        logging.exception("Failed to open %s", volpath)
+        return None
     return None
 
 
