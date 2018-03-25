@@ -367,7 +367,7 @@ def cloneVMDK(vm_name, vmdk_path, opts={}, vm_uuid=None, datastore_url=None, vm_
 
     # Clone creates side cars with a random key and hence filename
     # which need more work to figure out and use each time a volume
-    # op is performed. Remove the side car that hte clone created
+    # op is performed. Remove the side car that the clone created
     # and create a new one.  Fix up the KV for the destination
     if not kv.fixup_kv(src_vmdk_path, vmdk_path):
         msg = ("Failed to create volume KV for %s" % vol_name)

@@ -315,7 +315,7 @@ def load(volpath):
     vol_type = get_vol_type(volpath)
     if not vol_type:
         logging.warning("KV delete - could not determine type of volume %s", volpath)
-        return False
+        return None
     if vol_type == c_uint32(KV_VOL_VIRTUAL).value:
         meta_file = lib.DiskLib_SidecarMakeFileName(volpath.encode(),
                                                     DVOL_KEY.encode())
